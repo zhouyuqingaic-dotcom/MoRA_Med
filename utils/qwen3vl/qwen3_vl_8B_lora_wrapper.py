@@ -1,209 +1,440 @@
 import types
+from typing import Optional, List
+
 import torch
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import PreTrainedModel
 
-# 导入我们刚刚写好的底层兵器库与指挥部
-from utils.qwen3vl.qwen3_vl_8B_visual_adapter import VisualAdapter_Global, VisualAdapter_Local, VisualAdapter_Region
-from utils.qwen3vl.qwen3_vl_8B_visual_adapters_fusion import Qwen3VLMoEVisualAdapterDynamicFusion, \
-    Qwen3VLMoEVisualAdapterFixedFusion
+from utils.qwen3vl.qwen3_vl_8B_visual_adapter import (
+    VisualAdapter_F1,
+    VisualAdapter_F3,
+    VisualAdapter_F5,
+    VisualAdapter_F7,
+)
+
+from utils.qwen3vl.qwen3_vl_8B_visual_adapters_fusion import (
+    Qwen3VLMoEVisualAdapterFusion,
+)
 
 
 # =====================================================================
-# 🧠 新增：冻结的 BioMedCLIP 跨模态特征提取器
+# 冻结的 BioMedCLIP 跨模态特征提取器
 # =====================================================================
 class FrozenBioMedCLIPFeatureExtractor(nn.Module):
-    def __init__(self, raw_model):
+    """
+    Frozen BioMedCLIP feature extractor.
+
+    只负责提取 BioMedCLIP image/text features。
+    不参与梯度更新。
+    """
+
+    def __init__(self, raw_model: nn.Module):
         super().__init__()
         self.model = raw_model
         self.model.eval()
-        # 绝对冻结，不参与任何梯度更新
+
         for param in self.model.parameters():
             param.requires_grad = False
 
     def forward(self, biomed_img_tensors, biomed_txt_tokens):
         with torch.no_grad():
-            img_feat, txt_feat, _ = self.model(biomed_img_tensors, biomed_txt_tokens)
+            img_feat, txt_feat, _ = self.model(
+                biomed_img_tensors,
+                biomed_txt_tokens,
+            )
+
             img_feat = torch.nn.functional.normalize(img_feat, dim=-1)
             txt_feat = torch.nn.functional.normalize(txt_feat, dim=-1)
+
         return img_feat, txt_feat
 
 
 # =====================================================================
-# 👑 核心重构：多尺度混合专家 Wrapper (Dual-Tuning MoE)
+# Qwen3-VL + LoRA + V2-lite Visual Residual Adapter Wrapper
 # =====================================================================
 class Qwen3VLLoraAndVisualAdapterWrapper:
-    def __init__(
-            self,
-            lora_r, lora_alpha, lora_dropout, lora_target_modules, gradient_checkpointing,
-            visual_adapter_hidden_dim=4096,
-            visual_adapter_r=16,
-            router_mode="dynamic",
-            biomed_extractor=None,
-            global_adapter_kernel_size=1,
-            local_adapter_kernel_size=3,
-            region_adapter_kernel_size=5,
-            fixed_weights=[0.33, 0.33, 0.34],  # 👈 【修复 1】接住 Trainer 传来的 fixed_weights
-            moe_alpha=0.1, #👈 新增
-    ):
-        self.moe_alpha = moe_alpha  # 👈 新增
+    """
+    Qwen3-VL LoRA + RoMA-Net V2-lite visual residual adapter wrapper.
 
+    支持消融：
+    A0:
+        Qwen3-VL + LoRA
+        enable_visual_adapter=False
+
+    A1:
+        v2 fixed-alpha, w/o soft gate
+        scale_mode="learned"
+        gate_mode="fixed"
+        fixed_gate=1.0
+        lambda_mode="fixed"
+        fixed_lambda=alpha
+        use_rms_norm=True
+
+    A2:
+        v2 learnable-lambda, w/o soft gate
+        scale_mode="learned"
+        gate_mode="fixed"
+        fixed_gate=1.0
+        lambda_mode="learnable"
+        use_rms_norm=True
+
+    A3:
+        v2 with soft gate, fixed-alpha
+        scale_mode="learned"
+        gate_mode="learned"
+        lambda_mode="fixed"
+        fixed_lambda=alpha
+        use_rms_norm=True
+
+    A5:
+        Full RoMA-Net V2-lite
+        scale_mode="learned"
+        gate_mode="learned"
+        lambda_mode="learnable"
+        use_rms_norm=True
+
+    A4 optional:
+        Full w/o RMS
+        scale_mode="learned"
+        gate_mode="learned"
+        lambda_mode="learnable"
+        use_rms_norm=False
+    """
+
+    def __init__(
+        self,
+        lora_r: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        lora_target_modules: List[str],
+        gradient_checkpointing: bool,
+
+        visual_adapter_hidden_dim: int = 4096,
+        visual_adapter_r: int = 16,
+
+        # A0 控制：是否挂载 visual residual adapter
+        enable_visual_adapter: bool = True,
+
+        # BioMedCLIP
+        biomed_extractor: Optional[nn.Module] = None,
+        use_cross_modal_prior: bool = True,
+
+        # Router hidden dim
+        router_hidden_dim: int = 128,
+
+        # Scale routing
+        scale_mode: str = "learned",                 # learned / fixed
+        fixed_scale_weights: Optional[List[float]] = None,
+
+        # Soft gate
+        gate_mode: str = "learned",                  # learned / fixed
+        fixed_gate: float = 1.0,
+        gate_init: float = 0.5,
+
+        # Residual scale
+        lambda_mode: str = "learnable",              # learnable / fixed
+        fixed_lambda: float = 0.1,
+        lambda_max: float = 1.0,
+        lambda_init: float = 0.1,
+
+        # RMS residual normalization
+        use_rms_norm: bool = True,
+        residual_norm_eps: float = 1e-6,
+        residual_norm_ratio_clip: Optional[float] = 10.0,
+    ):
+        # LoRA
         self.r = lora_r
         self.alpha = lora_alpha
         self.dropout = lora_dropout
         self.target_modules = lora_target_modules
         self.gradient_checkpointing = gradient_checkpointing
+
+        # Visual adapter
         self.visual_adapter_hidden_dim = visual_adapter_hidden_dim
         self.visual_adapter_r = visual_adapter_r
-        self.router_mode = router_mode
+        self.enable_visual_adapter = enable_visual_adapter
+
+        # BioMedCLIP
         self.biomed_extractor = biomed_extractor
+        self.use_cross_modal_prior = use_cross_modal_prior
 
-        self.global_adapter_kernel_size = global_adapter_kernel_size
-        self.local_adapter_kernel_size = local_adapter_kernel_size
-        self.region_adapter_kernel_size = region_adapter_kernel_size
-        self.fixed_weights = fixed_weights  # 👈 【修复 1】保存为类属性
+        # Router
+        self.router_hidden_dim = router_hidden_dim
 
-    def wrap(self, model: PreTrainedModel) -> PreTrainedModel:
-        # 1. 基础 LoRA 环境准备
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=self.gradient_checkpointing,
-                                                gradient_checkpointing_kwargs={"use_reentrant": False})
-        if hasattr(model, "config"): model.config.use_cache = False
-        peft_model = get_peft_model(model,
-                                    LoraConfig(r=self.r, lora_alpha=self.alpha, target_modules=self.target_modules,
-                                               lora_dropout=self.dropout, bias="none", task_type="CAUSAL_LM"))
-        if hasattr(peft_model, "enable_input_require_grads"): peft_model.enable_input_require_grads()
+        # Scale routing
+        self.scale_mode = scale_mode
+        self.fixed_scale_weights = fixed_scale_weights
 
-        # 2. 定位视觉塔并获取设备与精度
-        print(f"\n✨ [MoE Adapter] 正在启动多尺度视觉塔脑机接驳手术 (模式: {self.router_mode})...")
-        vision_tower = peft_model.base_model.model.model.visual
-        hidden_dim = self.visual_adapter_hidden_dim
-        r = self.visual_adapter_r
-        ref_param = next(vision_tower.parameters())
-        adapter_dtype = ref_param.dtype if ref_param.is_floating_point() else torch.bfloat16
+        # Soft gate
+        self.gate_mode = gate_mode
+        self.fixed_gate = fixed_gate
+        self.gate_init = gate_init
 
-        # ===============================================================
-        # 3. 【依赖注入】实例化三大视觉Adapter与融合枢纽
-        # ===============================================================
-        adapter_global = VisualAdapter_Global(hidden_dim=hidden_dim,
-                                              r=r,
-                                              kernel_size=self.global_adapter_kernel_size)
-        adapter_local = VisualAdapter_Local(hidden_dim=hidden_dim,
-                                            r=r,
-                                            kernel_size=self.local_adapter_kernel_size)
-        adapter_region = VisualAdapter_Region(hidden_dim=hidden_dim,
-                                              r=r,
-                                              kernel_size=self.region_adapter_kernel_size)
+        # Lambda
+        self.lambda_mode = lambda_mode
+        self.fixed_lambda = fixed_lambda
+        self.lambda_max = lambda_max
+        self.lambda_init = lambda_init
 
-        if self.router_mode == "dynamic":
-            #  【修复 2】检查 biomed_extractor 实例是否存在，而不是检查被淘汰的路径
-            if self.biomed_extractor is None:
-                raise ValueError("⚠️ 动态路由模式下，Trainer 必须传入实例化的 biomed_extractor!")
+        # RMS
+        self.use_rms_norm = use_rms_norm
+        self.residual_norm_eps = residual_norm_eps
+        self.residual_norm_ratio_clip = residual_norm_ratio_clip
 
-            fusion_layer = Qwen3VLMoEVisualAdapterDynamicFusion(
-                hidden_dim=hidden_dim,
-                adapter_global=adapter_global,
-                adapter_local=adapter_local,
-                adapter_region=adapter_region,
-                moe_alpha=self.moe_alpha,  # 👈 新增透传
-            )
-            # 挂载冻结的 BioMedCLIP 大脑到 peft_model 上
-            peft_model.biomed_extractor = self.biomed_extractor.to(device=ref_param.device, dtype=adapter_dtype)
-        else:
-            fusion_layer = Qwen3VLMoEVisualAdapterFixedFusion(
-                hidden_dim=hidden_dim,
-                adapter_global=adapter_global,
-                adapter_local=adapter_local,
-                adapter_region=adapter_region,
-                fixed_weights=self.fixed_weights,  # 👈 【修复 3】把外面的硬融合比例准确无误地传给底座！
-                moe_alpha=self.moe_alpha,  # 👈 新增透传
-            )
+        self._validate_modes()
 
-        # 上户口：将融合枢纽挂载到视觉塔，使其被 PyTorch 追踪并更新梯度
-        vision_tower.res_adapter = fusion_layer.to(device=ref_param.device, dtype=adapter_dtype)
+    def _validate_modes(self):
+        if self.scale_mode not in {"learned", "fixed"}:
+            raise ValueError(f"未知 scale_mode: {self.scale_mode}")
 
-        # ===============================================================
-        # 4. 【第一重劫持】外层大脑截获与传送 (Outermost Forward Patch)
-        # ===============================================================
+        if self.gate_mode not in {"learned", "fixed"}:
+            raise ValueError(f"未知 gate_mode: {self.gate_mode}")
+
+        if self.lambda_mode not in {"learnable", "fixed"}:
+            raise ValueError(f"未知 lambda_mode: {self.lambda_mode}")
+
+    def _patch_forward_to_drop_biomed_kwargs(self, peft_model: PreTrainedModel):
+        """
+        A0 LoRA-only 时也可能 trainer/collator 传入 biomed_image_tensors / biomed_text_tokens。
+        原始 Qwen forward 不认识这些参数，所以这里要安全 pop 掉。
+        """
         peft_model.original_forward = peft_model.forward
 
         def patched_model_forward(self, *args, **kwargs):
-            # 💡 极度关键的 kwargs.pop()：
-            biomed_img = kwargs.pop("biomed_image_tensors", None)
-            biomed_txt = kwargs.pop("biomed_text_tokens", None)
-
-            # 只有在动态模式且传了参数的情况下，才激活大脑
-            if biomed_img is not None and biomed_txt is not None and hasattr(self, "biomed_extractor"):
-                img_f, txt_f = self.biomed_extractor(biomed_img, biomed_txt)
-                # 🛸 时空传送：把算出的跨模态特征强行塞进视觉塔的隐式变量里
-                self.base_model.model.model.visual.current_biomed_img_feat = img_f
-                self.base_model.model.model.visual.current_biomed_txt_feat = txt_f
-
-            # 干净利落地调用原始大模型前向传播
+            kwargs.pop("biomed_image_tensors", None)
+            kwargs.pop("biomed_text_tokens", None)
             return self.original_forward(*args, **kwargs)
 
         peft_model.forward = types.MethodType(patched_model_forward, peft_model)
 
+    def wrap(self, model: PreTrainedModel) -> PreTrainedModel:
         # ===============================================================
-        # 5. 【第二重劫持】内层肌肉接收与融合 (Inner Vision Tower Patch)
+        # 1. 准备 QLoRA / LoRA 训练环境
+        # ===============================================================
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=self.gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+
+        peft_model = get_peft_model(
+            model,
+            LoraConfig(
+                r=self.r,
+                lora_alpha=self.alpha,
+                target_modules=self.target_modules,
+                lora_dropout=self.dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            ),
+        )
+
+        if hasattr(peft_model, "enable_input_require_grads"):
+            peft_model.enable_input_require_grads()
+
+        # ===============================================================
+        # 2. A0: Qwen3-VL + LoRA only，不挂 visual adapter
+        # ===============================================================
+        if not self.enable_visual_adapter:
+            self._patch_forward_to_drop_biomed_kwargs(peft_model)
+
+            print("\n✅ [A0 / LoRA Only] 未挂载 visual residual adapter。")
+            peft_model.print_trainable_parameters()
+            return peft_model
+
+        # ===============================================================
+        # 3. V2-lite 需要 BioMedCLIP extractor
+        # ===============================================================
+        if self.biomed_extractor is None:
+            raise ValueError(
+                "V2-lite visual adapter 已启用，但 biomed_extractor=None。"
+                "请在 Trainer 中传入 FrozenBioMedCLIPFeatureExtractor 实例。"
+            )
+
+        # ===============================================================
+        # 4. 定位 Qwen3-VL 视觉塔
+        # ===============================================================
+        print(
+            "\n✨ [RoMA-Net V2-lite] 正在挂载四尺度 soft-gated visual residual adapter..."
+        )
+        print(
+            f"    scale_mode={self.scale_mode}, "
+            f"gate_mode={self.gate_mode}, "
+            f"lambda_mode={self.lambda_mode}, "
+            f"use_rms_norm={self.use_rms_norm}"
+        )
+
+        vision_tower = peft_model.base_model.model.model.visual
+
+        hidden_dim = self.visual_adapter_hidden_dim
+        r = self.visual_adapter_r
+
+        ref_param = next(vision_tower.parameters())
+        adapter_device = ref_param.device
+        adapter_dtype = ref_param.dtype if ref_param.is_floating_point() else torch.bfloat16
+
+        # ===============================================================
+        # 5. 实例化四个 residual experts: F1/F3/F5/F7
+        # ===============================================================
+        adapter_f1 = VisualAdapter_F1(
+            hidden_dim=hidden_dim,
+            r=r,
+        )
+        adapter_f3 = VisualAdapter_F3(
+            hidden_dim=hidden_dim,
+            r=r,
+        )
+        adapter_f5 = VisualAdapter_F5(
+            hidden_dim=hidden_dim,
+            r=r,
+        )
+        adapter_f7 = VisualAdapter_F7(
+            hidden_dim=hidden_dim,
+            r=r,
+        )
+
+        # ===============================================================
+        # 6. 实例化统一的消融友好 fusion module
+        # ===============================================================
+        fusion_layer = Qwen3VLMoEVisualAdapterFusion(
+            hidden_dim=hidden_dim,
+            adapter_f1=adapter_f1,
+            adapter_f3=adapter_f3,
+            adapter_f5=adapter_f5,
+            adapter_f7=adapter_f7,
+
+            router_hidden_dim=self.router_hidden_dim,
+
+            scale_mode=self.scale_mode,
+            fixed_scale_weights=self.fixed_scale_weights,
+
+            gate_mode=self.gate_mode,
+            fixed_gate=self.fixed_gate,
+            gate_init=self.gate_init,
+
+            lambda_mode=self.lambda_mode,
+            fixed_lambda=self.fixed_lambda,
+            lambda_max=self.lambda_max,
+            lambda_init=self.lambda_init,
+
+            use_rms_norm=self.use_rms_norm,
+            residual_norm_eps=self.residual_norm_eps,
+            residual_norm_ratio_clip=self.residual_norm_ratio_clip,
+
+            use_cross_modal_prior=self.use_cross_modal_prior,
+        )
+
+        # 挂到视觉塔上，使其被 PyTorch/PEFT 正确追踪
+        vision_tower.res_adapter = fusion_layer.to(
+            device=adapter_device,
+            dtype=adapter_dtype,
+        )
+
+        # 挂载冻结 BioMedCLIP extractor
+        peft_model.biomed_extractor = self.biomed_extractor.to(
+            device=adapter_device,
+            dtype=adapter_dtype,
+        )
+        peft_model.biomed_extractor.eval()
+
+        for param in peft_model.biomed_extractor.parameters():
+            param.requires_grad = False
+
+        # ===============================================================
+        # 7. 第一重 patch：外层 model.forward
+        #    负责截获 biomed_image_tensors / biomed_text_tokens
+        # ===============================================================
+        peft_model.original_forward = peft_model.forward
+
+        def patched_model_forward(self, *args, **kwargs):
+            biomed_img = kwargs.pop("biomed_image_tensors", None)
+            biomed_txt = kwargs.pop("biomed_text_tokens", None)
+
+            visual = self.base_model.model.model.visual
+
+            # 每次 forward 前先清空，避免上一个 batch 的 BioMedCLIP 特征残留
+            visual.current_biomed_img_feat = None
+            visual.current_biomed_txt_feat = None
+
+            if biomed_img is not None and biomed_txt is not None:
+                if not hasattr(self, "biomed_extractor"):
+                    raise ValueError(
+                        "当前 batch 传入了 BioMedCLIP 输入，但 peft_model 上没有 biomed_extractor。"
+                    )
+
+                img_f, txt_f = self.biomed_extractor(
+                    biomed_img,
+                    biomed_txt,
+                )
+
+                visual.current_biomed_img_feat = img_f
+                visual.current_biomed_txt_feat = txt_f
+
+            return self.original_forward(*args, **kwargs)
+
+        peft_model.forward = types.MethodType(
+            patched_model_forward,
+            peft_model,
+        )
+
+        # ===============================================================
+        # 8. 第二重 patch：视觉塔 forward
+        #    负责把 visual tokens 送入 V2-lite residual adapter
         # ===============================================================
         vision_tower.original_forward = vision_tower.forward
 
         def patched_vision_forward(self, *args, **kwargs):
             outputs = self.original_forward(*args, **kwargs)
 
-            # 接收外层传送过来的指令
             img_f = getattr(self, "current_biomed_img_feat", None)
             txt_f = getattr(self, "current_biomed_txt_feat", None)
 
-            # 📦 【绝杀提取】：从 Qwen 底层参数中获取图像的 3D 网格尺寸 (grid_thw)
             grid_thw = kwargs.get("grid_thw", None)
             if grid_thw is None and len(args) > 1:
                 grid_thw = args[1]
 
-            # 替换特征，并将特征传给 Fusion 层 (⚠️ 注意这里补上了 grid_thw)
-            # ==========================================================
-            # 🚀 替换特征，并将特征传给 Fusion 层
-            # ==========================================================
-            #动态模式传了 4 个参数，静态模式只传了 2 个参数。
-            is_dynamic = (img_f is not None and txt_f is not None)
+            if img_f is None or txt_f is None:
+                raise ValueError(
+                    "V2-lite visual adapter 已启用，但当前 forward 没有 BioMedCLIP 特征。"
+                    "请确认 collator/trainer 已传入 biomed_image_tensors 和 biomed_text_tokens。"
+                )
+
+            if grid_thw is None:
+                raise ValueError(
+                    "V2-lite visual adapter 已启用，但 vision forward 中没有拿到 grid_thw。"
+                )
 
             if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-                if is_dynamic:
-                    outputs.pooler_output = self.res_adapter(
-                        outputs.pooler_output,
-                        biomed_img_feat=img_f,
-                        biomed_txt_feat=txt_f,
-                        grid_thw=grid_thw
-                    )
-                else:
-                    outputs.pooler_output = self.res_adapter(
-                        outputs.pooler_output,
-                        grid_thw=grid_thw
-                    )
+                outputs.pooler_output = self.res_adapter(
+                    outputs.pooler_output,
+                    biomed_img_feat=img_f,
+                    biomed_txt_feat=txt_f,
+                    grid_thw=grid_thw,
+                )
 
             if hasattr(outputs, "deepstack_features") and outputs.deepstack_features is not None:
-                if is_dynamic:
-                    outputs.deepstack_features = [
-                        self.res_adapter(
-                            x,
-                            biomed_img_feat=img_f,
-                            biomed_txt_feat=txt_f,
-                            grid_thw=grid_thw
-                        ) for x in outputs.deepstack_features
-                    ]
-                else:
-                    outputs.deepstack_features = [
-                        self.res_adapter(
-                            x,
-                            grid_thw=grid_thw
-                        ) for x in outputs.deepstack_features
-                    ]
+                outputs.deepstack_features = [
+                    self.res_adapter(
+                        x,
+                        biomed_img_feat=img_f,
+                        biomed_txt_feat=txt_f,
+                        grid_thw=grid_thw,
+                    )
+                    for x in outputs.deepstack_features
+                ]
+
             return outputs
 
-        vision_tower.forward = types.MethodType(patched_vision_forward, vision_tower)
+        vision_tower.forward = types.MethodType(
+            patched_vision_forward,
+            vision_tower,
+        )
 
-        print(f"✅ [MoE Adapter] 成功挂载！融合模式: {self.router_mode.upper()}")
+        print("✅ [RoMA-Net V2-lite] visual residual adapter 挂载成功！")
         peft_model.print_trainable_parameters()
-        return peft_model
 
+        return peft_model
