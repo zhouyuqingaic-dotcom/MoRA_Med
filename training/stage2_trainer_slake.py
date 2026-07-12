@@ -23,7 +23,92 @@ from utils.ddp.ddp_utils import ddp_print
 # 引入 PEFT 的状态字典注入工具
 from peft import set_peft_model_state_dict
 from safetensors.torch import load_file
+from utils.data_tools.prompt_cleaning.slake_answer_cleaning import slake_answer_train_cleaning
 
+def filter_invalid_slake_samples(
+    dataset,
+    split_name: str,
+    print_rank: int,
+):
+    """
+    在进入 DataLoader 前过滤没有有效监督信号的 SLAKE 样本。
+
+    过滤条件：
+    1. question 为空；
+    2. answer 经训练清洗后为空。
+
+    必须在构造 ConcatDataset 和 DDP DataLoader 之前完成，
+    不能在 Collator 中临时丢弃样本。
+    """
+    original_count = len(dataset.samples)
+
+    valid_samples = []
+    invalid_samples = []
+
+    for index, row in enumerate(dataset.samples):
+        raw_question = row.get("question", "")
+        raw_answer = row.get("answer", "")
+
+        question_text = (
+            ""
+            if raw_question is None
+            else str(raw_question).strip()
+        )
+
+        answer_source = (
+            ""
+            if raw_answer is None
+            else str(raw_answer)
+        )
+
+        answer_text = slake_answer_train_cleaning(
+            answer_source
+        )
+
+        if not question_text or not answer_text:
+            invalid_samples.append(
+                {
+                    "index": index,
+                    "img_name": row.get("img_name", ""),
+                    "img_id": row.get("img_id", ""),
+                    "question": question_text,
+                    "raw_answer": repr(raw_answer),
+                    "cleaned_answer": repr(answer_text),
+                }
+            )
+            continue
+
+        valid_samples.append(row)
+
+    dataset.samples = valid_samples
+
+    ddp_print(
+        f"[SLAKE 数据清理] {split_name}: "
+        f"原始={original_count}, "
+        f"保留={len(valid_samples)}, "
+        f"删除={len(invalid_samples)}",
+        print_rank=print_rank,
+    )
+
+    if invalid_samples:
+        preview = invalid_samples[:10]
+
+        ddp_print(
+            f"[SLAKE 数据清理] {split_name} "
+            f"无效样本示例（最多 10 条）：\n"
+            + "\n".join(
+                (
+                    f"  index={item['index']}, "
+                    f"img_name={item['img_name']}, "
+                    f"img_id={item['img_id']}, "
+                    f"question={item['question']!r}, "
+                    f"raw_answer={item['raw_answer']}, "
+                    f"cleaned_answer={item['cleaned_answer']}"
+                )
+                for item in preview
+            ),
+            print_rank=print_rank,
+        )
 
 def get_visual_adapter(model):
     """
@@ -171,9 +256,28 @@ def main():
     )
 
     # 施加黑魔法：拼装成将近 1.2 万条数据的训练集
-    # train_dataset = ConcatDataset([train_subset, val_subset])
-    train_dataset = ConcatDataset([train_subset,val_subset])
-    ddp_print(f"✅ 数据集缝合完成，共有 {len(train_dataset)} 条高纯度医学样本！", print_rank=cfg.print_rank)
+    # 在构造 ConcatDataset 和 DDP DataLoader 前过滤无效监督样本。
+    filter_invalid_slake_samples(
+        dataset=train_subset,
+        split_name="train",
+        print_rank=cfg.print_rank,
+    )
+
+    filter_invalid_slake_samples(
+        dataset=val_subset,
+        split_name="validate",
+        print_rank=cfg.print_rank,
+    )
+
+    train_dataset = ConcatDataset(
+        [train_subset, val_subset]
+    )
+
+    ddp_print(
+        f"✅ 数据集清理与合并完成，共有 "
+        f"{len(train_dataset)} 条有效医学样本。",
+        print_rank=cfg.print_rank,
+    )
 
     # ==========================================
     # 2. 加载 Qwen3-VL 4-bit 底座模型
