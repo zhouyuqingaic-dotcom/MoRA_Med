@@ -25,27 +25,81 @@ from peft import set_peft_model_state_dict
 from safetensors.torch import load_file
 
 
+def get_visual_adapter(model):
+    """
+    获取 RoMA-Net V2-lite visual adapter。
+
+    兼容普通 PEFT 模型和 DDP 包装后的模型。
+    """
+    if hasattr(model, "module"):
+        model = model.module
+
+    try:
+        return model.base_model.model.model.visual.res_adapter
+    except AttributeError:
+        return None
+
+
 class VisualAdapterSaveCallback(TrainerCallback):
     """
-    专属回调：在 HF Trainer 自动保存 checkpoint 时，强制将 MoE Visual Adapter 权重一并保存！
+    在 Hugging Face Trainer 保存 checkpoint 时，
+    同步保存 RoMA-Net visual adapter。
+
+    A0 不包含 visual adapter，因此自动跳过。
+    A1～A5 会在 checkpoint-* 中保存 visual_adapter.pt。
     """
 
+    def __init__(self, enable_visual_adapter: bool):
+        self.enable_visual_adapter = bool(enable_visual_adapter)
+
     def on_save(self, args, state, control, **kwargs):
-        checkpoint_folder = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        # A0 不包含 visual adapter。
+        if not self.enable_visual_adapter:
+            return control
+
+        # 只允许主进程写文件，避免多卡同时覆盖。
+        if not state.is_world_process_zero:
+            return control
+
         model = kwargs["model"]
+        adapter_module = get_visual_adapter(model)
 
-        try:
-            # 兼容 DDP 和 PEFT 包装的取法
-            if hasattr(model, "module"):  # DDP wrapper
-                adapter_module = model.module.base_model.model.model.visual.res_adapter
-            else:
-                adapter_module = model.base_model.model.model.visual.res_adapter
+        if adapter_module is None:
+            raise RuntimeError(
+                "enable_visual_adapter=True，"
+                "但模型中没有找到 visual.res_adapter。"
+            )
 
-            adapter_save_path = os.path.join(checkpoint_folder, "visual_adapter.pt")
-            torch.save(adapter_module.state_dict(), adapter_save_path)
-            print(f"\n  [Callback] ✨ MoE 多尺度视觉适配器权重已同步保存至: {adapter_save_path}")
-        except Exception as e:
-            print(f"\n  [Callback] ❌ 保存 MoE 视觉适配器失败: {e}")
+        checkpoint_dir = os.path.join(
+            args.output_dir,
+            f"checkpoint-{state.global_step}",
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        adapter_save_path = os.path.join(
+            checkpoint_dir,
+            "visual_adapter.pt",
+        )
+
+        # 转到 CPU 后保存，避免保存 GPU Tensor。
+        adapter_state_dict = {
+            name: tensor.detach().cpu()
+            for name, tensor in adapter_module.state_dict().items()
+        }
+
+        torch.save(
+            adapter_state_dict,
+            adapter_save_path,
+        )
+
+        print(
+            "\n[Callback] Visual adapter 已保存至："
+            f"{adapter_save_path}"
+        )
+
+        return control
+
+
 
 
 def set_seed(seed: int):
@@ -72,18 +126,29 @@ def main():
     set_seed(cfg.seed)
 
     ddp_print("\n" + "=" * 60, print_rank=cfg.print_rank)
-    ddp_print(f"🚀 [1/6] 启动 Route B+ (Stage 2: SLAKE 降维打击) 分布式微调！模式: {cfg.router_mode.upper()}",
-              print_rank=cfg.print_rank)
-    ddp_print(f"🔗 继承 Stage 1 权重目录: {stage1_weights_dir}", print_rank=cfg.print_rank)
+    ddp_print(
+        f"🚀 [1/6] 启动 RoMA-Net V2-lite Stage 2 SLAKE 训练！"
+        f"当前消融: {cfg.ablation_id}",
+        print_rank=cfg.print_rank,
+    )
+    ddp_print(
+        f"    enable_visual_adapter={cfg.enable_visual_adapter}, "
+        f"scale_mode={cfg.scale_mode}, "
+        f"gate_mode={cfg.gate_mode}, "
+        f"lambda_mode={cfg.lambda_mode}, "
+        f"use_rms_norm={cfg.use_rms_norm}",
+        print_rank=cfg.print_rank,
+    )
+    ddp_print(
+        f"🔗 Stage 1 权重目录: {stage1_weights_dir}",
+        print_rank=cfg.print_rank,
+    )
+    ddp_print(
+        f"📁 Stage 2 输出目录: {output_dir}",
+        print_rank=cfg.print_rank,
+    )
     ddp_print("=" * 60, print_rank=cfg.print_rank)
 
-    # ============================================================
-    # 🔍 新增：强制打印内存中实际读取到的核心配置与路径 (抓虫专用)
-    # ============================================================
-    ddp_print(f"💡 [Debug] 内存中实际读取的 moe_alpha 值: {cfg.moe_alpha}", print_rank=cfg.print_rank)
-    ddp_print(f"🔗 [Debug] 继承 Stage 1 权重目录: {stage1_weights_dir}", print_rank=cfg.print_rank)
-    ddp_print(f"📁 [Debug] Stage 2 本次输出主目录: {output_dir}", print_rank=cfg.print_rank)
-    ddp_print("=" * 60, print_rank=cfg.print_rank)
 
     if local_rank in [-1, 0]:
         os.makedirs(output_dir, exist_ok=True)
@@ -136,10 +201,25 @@ def main():
     biomed_transform = None
     biomed_tokenizer = None
 
-    if cfg.router_mode == "dynamic":
+    if cfg.enable_visual_adapter:
+        ddp_print(
+            "\n⏳ [4/6] 正在加载 BioMedCLIP...",
+            print_rank=cfg.print_rank,
+        )
+
         biomed_extractor, biomed_transform, biomed_tokenizer = load_biomedclip(
             biomedclip_path=cfg.biomedclip_path,
-            print_rank=cfg.print_rank
+            print_rank=cfg.print_rank,
+        )
+
+        ddp_print(
+            "✅ BioMedCLIP 加载完成。",
+            print_rank=cfg.print_rank,
+        )
+    else:
+        ddp_print(
+            "\nℹ️ 当前为 A0 / LoRA-only，不加载 BioMedCLIP。",
+            print_rank=cfg.print_rank,
         )
 
     # ==========================================
@@ -149,46 +229,143 @@ def main():
 
     # 4.1 使用 Wrapper 组装架构
     wrapper = Qwen3VLLoraAndVisualAdapterWrapper(
+        # LoRA
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
         lora_dropout=cfg.lora_dropout,
         lora_target_modules=cfg.lora_target_modules,
         gradient_checkpointing=cfg.gradient_checkpointing,
+
+        # Visual adapter
         visual_adapter_hidden_dim=cfg.visual_adapter_hidden_dim,
         visual_adapter_r=cfg.visual_adapter_r,
-        router_mode=cfg.router_mode,
+        enable_visual_adapter=cfg.enable_visual_adapter,
+
+        # BioMedCLIP route feature
         biomed_extractor=biomed_extractor,
-        global_adapter_kernel_size=cfg.global_adapter_kernel_size,
-        local_adapter_kernel_size=cfg.local_adapter_kernel_size,
-        region_adapter_kernel_size=cfg.region_adapter_kernel_size,
-        fixed_weights=cfg.fixed_weights,
-        moe_alpha=cfg.moe_alpha,
+        use_cross_modal_prior=cfg.use_cross_modal_prior,
+
+        # Router backbone
+        router_hidden_dim=cfg.router_hidden_dim,
+
+        # 四尺度路由
+        scale_mode=cfg.scale_mode,
+        fixed_scale_weights=cfg.fixed_scale_weights,
+
+        # Soft gate
+        gate_mode=cfg.gate_mode,
+        fixed_gate=cfg.fixed_gate,
+        gate_init=cfg.gate_init,
+
+        # 有界 lambda
+        lambda_mode=cfg.lambda_mode,
+        fixed_lambda=cfg.fixed_lambda,
+        lambda_max=cfg.lambda_max,
+        lambda_init=cfg.lambda_init,
+
+        # RMS residual normalization
+        use_rms_norm=cfg.use_rms_norm,
+        residual_norm_eps=cfg.residual_norm_eps,
+        residual_norm_ratio_clip=cfg.residual_norm_ratio_clip,
     )
+
     peft_model = wrapper.wrap(base_model)
 
-    # 4.2 🚀 绝杀：注入 Stage 1 的 LoRA 权重
-    lora_safe_path = os.path.join(stage1_weights_dir, "adapter_model.safetensors")
-    lora_bin_path = os.path.join(stage1_weights_dir, "adapter_model.bin")
+    # 4.2 🚀 注入 Stage 1 的 LoRA 权重
+    lora_safe_path = os.path.join(
+        stage1_weights_dir,
+        "adapter_model.safetensors",
+    )
 
-    if os.path.exists(lora_safe_path):
-        set_peft_model_state_dict(peft_model, load_file(lora_safe_path))
-        ddp_print(f"✅ 成功接驳 Stage 1 LoRA 权重 (safetensors)", print_rank=cfg.print_rank)
-    elif os.path.exists(lora_bin_path):
-        set_peft_model_state_dict(peft_model, torch.load(lora_bin_path, map_location="cpu"))
-        ddp_print(f"✅ 成功接驳 Stage 1 LoRA 权重 (bin)", print_rank=cfg.print_rank)
+    lora_bin_path = os.path.join(
+        stage1_weights_dir,
+        "adapter_model.bin",
+    )
+
+    if os.path.isfile(lora_safe_path):
+        lora_state_dict = load_file(lora_safe_path)
+
+        set_peft_model_state_dict(
+            peft_model,
+            lora_state_dict,
+        )
+
+        ddp_print(
+            f"✅ 已加载 Stage 1 LoRA：{lora_safe_path}",
+            print_rank=cfg.print_rank,
+        )
+
+    elif os.path.isfile(lora_bin_path):
+        lora_state_dict = torch.load(
+            lora_bin_path,
+            map_location="cpu",
+        )
+
+        set_peft_model_state_dict(
+            peft_model,
+            lora_state_dict,
+        )
+
+        ddp_print(
+            f"✅ 已加载 Stage 1 LoRA：{lora_bin_path}",
+            print_rank=cfg.print_rank,
+        )
+
     else:
-        raise FileNotFoundError(f"❌ 找不到 Stage 1 的 LoRA 权重文件，请检查: {stage1_weights_dir}")
+        raise FileNotFoundError(
+            "找不到 Stage 1 LoRA 权重：\n"
+            f"  {lora_safe_path}\n"
+            f"  {lora_bin_path}"
+        )
 
     # 4.3 🚀 注入 Stage 1 的 MoE 视觉适配器权重
-    adapter_pt_path = os.path.join(stage1_weights_dir, "visual_adapter.pt")
-    if not os.path.exists(adapter_pt_path):
-        raise FileNotFoundError(f"❌ 找不到 Stage 1 的 Visual Adapter 权重: {adapter_pt_path}")
+    if cfg.enable_visual_adapter:
+        adapter_pt_path = os.path.join(
+            stage1_weights_dir,
+            "visual_adapter.pt",
+        )
 
-    adapter_state_dict = torch.load(adapter_pt_path, map_location="cpu")
-    peft_model.base_model.model.model.visual.res_adapter.load_state_dict(adapter_state_dict)
-    ddp_print(f"✅ 成功接驳 Stage 1 MoE 多尺度视觉适配器权重！", print_rank=cfg.print_rank)
+        if not os.path.isfile(adapter_pt_path):
+            raise FileNotFoundError(
+                "当前消融启用了 visual adapter，"
+                "但找不到 Stage 1 权重："
+                f"{adapter_pt_path}"
+            )
 
-    peft_model.print_trainable_parameters()
+        adapter_module = get_visual_adapter(peft_model)
+
+        if adapter_module is None:
+            raise RuntimeError(
+                "当前配置 enable_visual_adapter=True，"
+                "但模型中没有成功挂载 visual.res_adapter。"
+            )
+
+        adapter_state_dict = torch.load(
+            adapter_pt_path,
+            map_location="cpu",
+        )
+
+        # Stage 2 必须与 Stage 1 采用完全一致的架构。
+        # strict=True 可在配置不一致时立即报错。
+        adapter_module.load_state_dict(
+            adapter_state_dict,
+            strict=True,
+        )
+
+        peft_model.print_trainable_parameters()
+
+        ddp_print(
+            f"✅ 已加载 Stage 1 visual adapter：{adapter_pt_path}",
+            print_rank=cfg.print_rank,
+        )
+
+    else:
+        ddp_print(
+            "ℹ️ 当前为 A0 / LoRA-only，"
+            "只加载 Stage 1 LoRA，不加载 visual_adapter.pt。",
+            print_rank=cfg.print_rank,
+        )
+
 
     # ==========================================
     # 5. 🚀 挂载 SLAKE 专属 Collator
@@ -233,7 +410,11 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collator,
-        callbacks=[VisualAdapterSaveCallback()],
+        callbacks=[
+            VisualAdapterSaveCallback(
+                enable_visual_adapter=cfg.enable_visual_adapter
+            )
+        ],
     )
 
     trainer.train()
@@ -249,14 +430,41 @@ def main():
         processor.save_pretrained(final_save_path)
         ddp_print(f"\n🎉 Stage 2 (SLAKE) 训练完成！LoRA 已保存至: {final_save_path}", print_rank=cfg.print_rank)
 
-        try:
-            adapter_module = peft_model.base_model.model.model.visual.res_adapter
-            adapter_save_path = os.path.join(final_save_path, "visual_adapter.pt")
-            torch.save(adapter_module.state_dict(), adapter_save_path)
-            ddp_print(f"✨ 视觉残差适配器 (SLAKE版) 权重已单独安全保存至: {adapter_save_path}",
-                      print_rank=cfg.print_rank)
-        except Exception as e:
-            ddp_print(f"❌ 保存 Visual Adapter 权重时发生错误: {e}", print_rank=cfg.print_rank)
+        if cfg.enable_visual_adapter:
+            adapter_module = get_visual_adapter(peft_model)
+
+            if adapter_module is None:
+                raise RuntimeError(
+                    "训练结束时没有找到 visual.res_adapter，"
+                    "无法保存 Stage 2 visual adapter。"
+                )
+
+            adapter_save_path = os.path.join(
+                final_save_path,
+                "visual_adapter.pt",
+            )
+
+            adapter_state_dict = {
+                name: tensor.detach().cpu()
+                for name, tensor in adapter_module.state_dict().items()
+            }
+
+            torch.save(
+                adapter_state_dict,
+                adapter_save_path,
+            )
+
+            ddp_print(
+                f"✨ Stage 2 visual adapter 已保存至: "
+                f"{adapter_save_path}",
+                print_rank=cfg.print_rank,
+            )
+        else:
+            ddp_print(
+                "ℹ️ 当前为 A0 / LoRA-only，"
+                "不保存 visual_adapter.pt。",
+                print_rank=cfg.print_rank,
+            )
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

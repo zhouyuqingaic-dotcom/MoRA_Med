@@ -1,38 +1,71 @@
 import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
 class Stage2TrainConfig:
-    """阶段二 (Stage 2: SLAKE) 降维打击全局配置类"""
+    """
+    Stage 2：SLAKE 微调配置。
 
-    # --- 1. 基础与输出路径配置 ---
-    # 输出目录 (Stage 2 SLAKE 专属结果目录)
-    output_dir_with_visual_adapter_dynamic: str = "/home/yuqing/Models/RouterB_Plus_MoA/Stage2_SLAKE/dynamic"
-    output_dir_with_visual_adapter_fixed: str = "/home/yuqing/Models/RouterB_Plus_MoA/Stage2_SLAKE/fixed"
+    重要原则：
+    - Stage 2 的模型结构必须与所加载的 Stage 1 消融结构一致；
+    - Stage 1 和 Stage 2 使用相同的 LoRA 配置；
+    - Stage 1 和 Stage 2 使用相同的 RoMA-Net V2-lite 配置；
+    - BioMedCLIP 仍然冻结，只重新加载编码器。
+    """
 
-    # ⚠️ 继承 Stage 1 权重的根目录 (保持不变，因为基座都是同一个 MIMIC-CXR 权重)
-    stage1_output_dir_with_visual_adapter_dynamic: str = "/home/yuqing/Models/RouterB_Plus_MoA/with_visual_adapter_dynamic"
-    stage1_output_dir_with_visual_adapter_fixed: str = "/home/yuqing/Models/RouterB_Plus_MoA/with_visual_adapter_fixed"
-
+    # =========================================================
+    # 1. 基础配置
+    # =========================================================
     print_rank: int = 0
-    seed: int = 2048 #1024 #1912 #1024 #2048 #1024 #1912
 
-    # --- 2. SLAKE 数据集配置 ---
-    slake_train_json_path: str = "/home/yuqing/Datas/SLAKE/Slake1.0/train.json"
-    slake_val_json_path: str = "/home/yuqing/Datas/SLAKE/Slake1.0/validate.json"
-    slake_test_json_path: str = "/home/yuqing/Datas/SLAKE/Slake1.0/test.json"
-    slake_image_root: str = "/home/yuqing/Datas/SLAKE/Slake1.0/imgs"
-    slake_max_size: int = 1024
+    # Stage 2 的随机种子
+    seed: int = 2048
 
-    # 🚀 降维打击核心：无缝复用 VQA-RAD 极其成功的 Suffix
-    slake_instruction_suffix: str = (
-        "Answer the question briefly and directly based on the image. Use a short medical term or phrase when possible. "
-        "For yes/no questions, answer with yes or no. Do not add unnecessary explanation."
+    # Stage 1 训练时使用的随机种子，用于推导权重目录
+    stage1_seed: int = 2048
+
+    # 必须与要加载的 Stage 1 消融保持一致
+    ablation_id: str = "A5"
+
+    output_root: str = "/home/yuqing/Models/MoRA_Med"
+
+    # =========================================================
+    # 2. SLAKE 数据
+    # =========================================================
+    slake_train_json_path: str = (
+        "/home/yuqing/Datas/SLAKE/Slake1.0/train.json"
+    )
+    slake_val_json_path: str = (
+        "/home/yuqing/Datas/SLAKE/Slake1.0/validate.json"
+    )
+    slake_test_json_path: str = (
+        "/home/yuqing/Datas/SLAKE/Slake1.0/test.json"
+    )
+    slake_image_root: str = (
+        "/home/yuqing/Datas/SLAKE/Slake1.0/imgs"
     )
 
-    # --- 3. 模型与量化配置 ---
-    model_name_or_path: str = "/home/yuqing/Models/Qwen3-VL-8B-Instruct"
+    slake_max_size: int = 1024
+
+    slake_instruction_suffix: str = (
+        "Answer the question briefly and directly based on the image. "
+        "Use a short medical term or phrase when possible. "
+        "For yes/no questions, answer with yes or no. "
+        "Do not add unnecessary explanation."
+    )
+
+    # Smoke test；None 表示使用完整训练集
+    max_slake_train_samples: Optional[int] = None
+
+    # =========================================================
+    # 3. Qwen3-VL 与量化配置
+    # =========================================================
+    model_name_or_path: str = (
+        "/home/yuqing/Models/Qwen3-VL-8B-Instruct"
+    )
+
     load_in_4bit: bool = True
     bnb_4bit_quant_type: str = "nf4"
     bnb_4bit_use_double_quant: bool = True
@@ -40,30 +73,24 @@ class Stage2TrainConfig:
     torch_dtype: str = "bfloat16"
     attn_implementation: str = "flash_attention_2"
 
-    # BioMedCLIP 本地绝对路径 (OpenCLIP 格式)
-    biomedclip_path: str = "/home/yuqing/Models/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    biomedclip_model_name: str = "ViT-B-16"
+    # =========================================================
+    # 4. BioMedCLIP
+    # =========================================================
+    biomedclip_path: str = (
+        "/home/yuqing/Models/"
+        "BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    )
+
+    use_cross_modal_prior: bool = True
 
     # =========================================================
-    # ✨ 核心创新点：视觉端 (Vision) 的残差适配器
+    # 5. LoRA
+    # 必须与 Stage 1 保持一致
     # =========================================================
-    visual_adapter_hidden_dim: int = 4096  # Qwen3-VL-8B 探测出的真实视觉-语言对齐维度
-    visual_adapter_r: int = 16
-
-    router_mode: str = "fixed" #"dynamic"  # 保持动态路由
-    global_adapter_kernel_size: int = 1
-    local_adapter_kernel_size: int = 3
-    region_adapter_kernel_size: int = 5
-
-    fixed_weights: list[float] = field(default_factory=lambda: [0.333, 0.333, 0.334])
-
-    # 🚀 【核心锁死】直接将 VQA-RAD 上推导出的通用物理边界 迁移过来！
-    moe_alpha: float = 0 #0.3 #1 #0.9 #0.8 #0.7 #0.6 #0.5 #0.4 #0.3 #0.2 #0.1
-
-    # --- 4. LoRA 配置 ---
     lora_r: int = 64
     lora_alpha: int = 128
     lora_dropout: float = 0.05
+
     lora_target_modules: list[str] = field(
         default_factory=lambda: [
             "q_proj",
@@ -76,54 +103,164 @@ class Stage2TrainConfig:
         ]
     )
 
-    # --- 5. 训练超参数 (针对 SLAKE 万级数据微调) ---
+    # =========================================================
+    # 6. SLAKE 训练超参数
+    # =========================================================
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 2
-
-    # ⚠️ SLAKE 数据量(1.2w)是 VQA-RAD 的 4 倍，Epoch 需要降低，防止过拟合
     num_train_epochs: float = 3.0
+
     learning_rate: float = 1e-5
     weight_decay: float = 0.01
     lr_scheduler_type: str = "cosine"
-
-    # ⚠️ Warmup 相应增加，适应更长的总 Step
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
-    logging_steps: int = 10
 
-    # ⚠️ Step 变多了，拉长保存间隔，防止硬盘爆炸
+    logging_steps: int = 10
     save_steps: int = 500
-    save_total_limit: int = 500  # 保留所有检查点，方便我们后续画曲线
+    save_total_limit: int = 2
 
     gradient_checkpointing: bool = True
     dataloader_num_workers: int = 8
 
+    # =========================================================
+    # 7. RoMA-Net V2-lite
+    # 必须与 Stage 1 保持一致
+    # =========================================================
+    enable_visual_adapter: bool = True
+
+    visual_adapter_hidden_dim: int = 4096
+    visual_adapter_r: int = 16
+    router_hidden_dim: int = 128
+
+    scale_mode: str = "learned"
+    fixed_scale_weights: list[float] = field(
+        default_factory=lambda: [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+        ]
+    )
+
+    gate_mode: str = "learned"
+    fixed_gate: float = 1.0
+    gate_init: float = 0.5
+
+    lambda_mode: str = "learnable"
+    fixed_lambda: float = 0.1
+    lambda_max: float = 1.0
+    lambda_init: float = 0.1
+
+    use_rms_norm: bool = True
+    residual_norm_eps: float = 1e-6
+    residual_norm_ratio_clip: Optional[float] = 10.0
+
     def __post_init__(self):
-        if self.attn_implementation == "flash_attention_2" and self.torch_dtype != "bfloat16":
-            print("⚠️ Warning: flash_attention_2 is best paired with bfloat16!")
+        aid = self.ablation_id.upper()
+        self.ablation_id = aid
 
-        # 🚀 1. 根据 router_mode 提取基础路径 (千万不要在这里提前拼接 final_weights)
-        if self.router_mode == "dynamic":
-            base_output_dir = self.output_dir_with_visual_adapter_dynamic
-            base_stage1_dir = self.stage1_output_dir_with_visual_adapter_dynamic
-        elif self.router_mode == "fixed":
-            base_output_dir = self.output_dir_with_visual_adapter_fixed
-            base_stage1_dir = self.stage1_output_dir_with_visual_adapter_fixed
+        # -----------------------------------------------------
+        # 必须与 Stage 1 TrainConfig 的消融定义完全相同
+        # -----------------------------------------------------
+        if aid == "A0":
+            self.enable_visual_adapter = False
+            self.scale_mode = "learned"
+            self.gate_mode = "fixed"
+            self.fixed_gate = 1.0
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 0.0
+            self.use_rms_norm = False
+
+        elif aid == "A1":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "fixed"
+            self.fixed_gate = 1.0
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 0.1
+            self.use_rms_norm = True
+
+        elif aid == "A2":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "fixed"
+            self.fixed_gate = 1.0
+            self.lambda_mode = "learnable"
+            self.lambda_init = 0.1
+            self.lambda_max = 1.0
+            self.use_rms_norm = True
+
+        elif aid == "A3":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 0.1
+            self.use_rms_norm = True
+
+        elif aid == "A4":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
+            self.lambda_init = 0.1
+            self.lambda_max = 1.0
+            self.use_rms_norm = False
+
+        elif aid == "A5":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
+            self.lambda_init = 0.1
+            self.lambda_max = 1.0
+            self.use_rms_norm = True
+
         else:
-            raise ValueError(f"❌ 不支持的 router_mode: {self.router_mode}，只能是 'dynamic' 或 'fixed'")
+            raise ValueError(
+                f"不支持的 ablation_id：{aid}。"
+                "可选值为 A0、A1、A2、A3、A4、A5。"
+            )
 
-        # 🚀 2. 给 Stage 2 的输出路径动态追加 Alpha 后缀
-        self.output_dir = f"{base_output_dir}_Alpha_{self.moe_alpha}_seed_{self.seed}"
+        # -----------------------------------------------------
+        # Stage 1 权重目录
+        # 命名规则与 Stage 1 TrainConfig 完全一致
+        # -----------------------------------------------------
+        stage1_experiment_dir = (
+            f"Stage1_MIMIC_CXR_"
+            f"{self.ablation_id}_"
+            f"Scale-{self.scale_mode}_"
+            f"Gate-{self.gate_mode}_"
+            f"Lambda-{self.lambda_mode}_"
+            f"RMS-{int(self.use_rms_norm)}_"
+            f"Seed-{self.stage1_seed}"
+        )
 
-        # 🚀 3. 给 Stage 1 的读取路径追加 Alpha 后缀，然后再在最末端拼接 "final_weights"
-        stage1_alpha_dir = f"{base_stage1_dir}_Alpha_{self.moe_alpha}_seed_{self.seed}"
-        self.stage1_weights_dir = os.path.join(stage1_alpha_dir, "final_weights")
+        self.stage1_weights_dir = os.path.join(
+            self.output_root,
+            stage1_experiment_dir,
+            "final_weights",
+        )
 
-        # =========================================================
-        # 🖨️ 新增：打印最终生成的路径，方便终端核对
-        # =========================================================
-        print("\n" + "=" * 60)
-        print(f"⚙️ [Stage 2 Train Config] 初始化完成 | 模式: {self.router_mode.upper()} | Alpha: {self.moe_alpha}")
-        print(f"📂 读取 Stage 1 权重: {self.stage1_weights_dir}")
-        print(f"💾 训练结果输出目录: {self.output_dir}")
-        print("=" * 60 + "\n")
+        # -----------------------------------------------------
+        # Stage 2 输出目录
+        # -----------------------------------------------------
+        stage2_experiment_dir = (
+            f"Stage2_SLAKE_"
+            f"{self.ablation_id}_"
+            f"Scale-{self.scale_mode}_"
+            f"Gate-{self.gate_mode}_"
+            f"Lambda-{self.lambda_mode}_"
+            f"RMS-{int(self.use_rms_norm)}_"
+            f"From-Stage1-Seed-{self.stage1_seed}_"
+            f"Seed-{self.seed}"
+        )
+
+        self.output_dir = os.path.join(
+            self.output_root,
+            stage2_experiment_dir,
+        )
+
+        print(f"Stage 1 权重目录：{self.stage1_weights_dir}")
+        print(f"Stage 2 输出目录：{self.output_dir}")

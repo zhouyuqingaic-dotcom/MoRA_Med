@@ -1,142 +1,334 @@
-from PIL import Image
-import torch
+from typing import Any, Sequence
 
-# 🚀 导入刚刚新建的 SLAKE 专属 Prompt 组装器
-from utils.data_tools.prompt_builder.slake_prompt_builder import build_slake_prompt
-# 🚀 导入刚刚新建的 SLAKE 专属极轻量答案清洗器
-from utils.data_tools.prompt_cleaning.slake_answer_cleaning import slake_answer_train_cleaning
+import torch
+from PIL import Image
+
+from utils.data_tools.prompt_builder.slake_prompt_builder import (
+    build_slake_prompt,
+)
+from utils.data_tools.prompt_cleaning.slake_answer_cleaning import (
+    slake_answer_train_cleaning,
+)
 
 
 class SLAKETrainCollator:
     """
-    SLAKE 专属的 DataCollator (阶段二训练专用)。
-    处理实体中心化的开放式短答，包含针对 SLAKE 的轻量级数据清洗。
-    仅对 Assistant 的最终回答部分计算 Loss，彻底屏蔽 User 问题、图像视觉 Token 及 padding 的梯度。
+    SLAKE Stage 2 训练数据整理器。
+
+    主要职责：
+    1. 为 Qwen3-VL 构造图像问答对话；
+    2. 为 RoMA-Net V2-lite 构造 BioMedCLIP 图像和问题输入；
+    3. 只对 assistant 的答案计算语言模型损失；
+    4. A0 不生成 BioMedCLIP 输入，A1～A5 生成。
     """
 
-    # 🚀 与 VQA-RAD 完美对齐：接收 biomed 相关工具和 router_mode 初始化
-    def __init__(self, processor, cfg, biomed_transform=None, biomed_tokenizer=None):
+    def __init__(
+        self,
+        processor: Any,
+        cfg: Any,
+        biomed_transform: Any = None,
+        biomed_tokenizer: Any = None,
+    ):
         self.processor = processor
-        self.cfg = cfg
+        self.max_size = int(cfg.slake_max_size)
+        self.instruction_suffix = cfg.slake_instruction_suffix
+        self.enable_visual_adapter = bool(cfg.enable_visual_adapter)
 
-        self.router_mode = cfg.router_mode
-        # 直接接收外部传来的极其轻量的预处理工具，完美兼容多进程
+        if self.processor.tokenizer.padding_side != "right":
+            raise ValueError(
+                "SLAKETrainCollator 要求 "
+                "processor.tokenizer.padding_side='right'。"
+            )
+
         self.biomed_img_transform = biomed_transform
         self.biomed_tokenizer = biomed_tokenizer
 
-    def __call__(self, batch):
-        texts = []
-        images = []
-        prompt_lengths = []
+        if self.enable_visual_adapter:
+            if self.biomed_img_transform is None:
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_transform。"
+                )
 
-        # 🎯 用于收集 BioMedCLIP 专属的张量
-        biomed_imgs = []
-        biomed_txts = []
+            if self.biomed_tokenizer is None:
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_tokenizer。"
+                )
 
-        for sample in batch:
-            # 1. 组装问题与指令 (调用 SLAKE 专属极简 Builder)
-            question_text = build_slake_prompt(
-                question=sample['question'],
-                instruction_suffix=self.cfg.slake_instruction_suffix
+    @staticmethod
+    def _load_rgb_image(image_path: str) -> Image.Image:
+        """读取图像并转换为独立的 RGB 图像。"""
+        try:
+            with Image.open(image_path) as image:
+                return image.convert("RGB")
+        except Exception as exc:
+            raise RuntimeError(
+                f"读取 SLAKE 图像失败：{image_path}"
+            ) from exc
+
+    def _resize_for_qwen(self, image: Image.Image) -> Image.Image:
+        """限制送入 Qwen3-VL 的图像最长边。"""
+        width, height = image.size
+        longest_edge = max(width, height)
+
+        if longest_edge <= self.max_size:
+            return image
+
+        scale = self.max_size / longest_edge
+
+        new_width = max(1, round(width * scale))
+        new_height = max(1, round(height * scale))
+
+        bicubic = getattr(
+            Image,
+            "Resampling",
+            Image,
+        ).BICUBIC
+
+        return image.resize(
+            (new_width, new_height),
+            resample=bicubic,
+        )
+
+    def __call__(
+        self,
+        batch: Sequence[dict[str, Any]],
+    ) -> dict[str, torch.Tensor]:
+        if not batch:
+            raise ValueError(
+                "SLAKETrainCollator 收到了空 batch。"
             )
 
-            # 2. 提取目标答案，并套上 SLAKE 极轻量清洗逻辑
-            answer_text = slake_answer_train_cleaning(sample["answer"])
+        prompt_texts: list[str] = []
+        full_texts: list[str] = []
+        qwen_images: list[Image.Image] = []
 
-            # 3. 构造 prompt-only 与 full-text 两套消息
-            messages_prompt = [
+        biomed_images: list[torch.Tensor] = []
+        biomed_questions: list[str] = []
+
+        for sample in batch:
+            image_path = sample["image_path"]
+
+            # 原始医学问题供 BioMedCLIP router 使用。
+            raw_question = str(sample["question"]).strip()
+
+            if not raw_question:
+                raise ValueError(
+                    f"发现空问题，图像路径：{image_path}"
+                )
+
+            # Qwen3-VL 使用带回答格式要求的完整指令。
+            qwen_question = build_slake_prompt(
+                question=raw_question,
+                instruction_suffix=self.instruction_suffix,
+            )
+
+            answer_text = slake_answer_train_cleaning(
+                sample["answer"]
+            )
+
+            if not answer_text:
+                raise ValueError(
+                    "发现清洗后为空的 SLAKE 答案，"
+                    f"图像路径：{image_path}"
+                )
+
+            prompt_messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": sample["image_path"]},
-                        {"type": "text", "text": question_text},
+                        {
+                            "type": "image",
+                            "image": image_path,
+                        },
+                        {
+                            "type": "text",
+                            "text": qwen_question,
+                        },
                     ],
                 }
             ]
 
-            text_prompt = self.processor.apply_chat_template(
-                messages_prompt,
+            prompt_text = self.processor.apply_chat_template(
+                prompt_messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
 
-            messages_full = messages_prompt + [
+            full_messages = prompt_messages + [
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "text", "text": answer_text},
+                        {
+                            "type": "text",
+                            "text": answer_text,
+                        }
                     ],
                 }
             ]
 
-            text_full = self.processor.apply_chat_template(
-                messages_full,
+            full_text = self.processor.apply_chat_template(
+                full_messages,
                 tokenize=False,
                 add_generation_prompt=False,
             )
 
-            # 4. 读取并 resize 图像
-            with Image.open(sample["image_path"]) as pil_img:
-                img = pil_img.convert("RGB")
-
-            # =======================================================
-            # 🧠 截获原始图片和文本，转化为 BioMed 特征
-            # =======================================================
-            if self.router_mode == "dynamic":
-                # 图像：将其 resize 和 center crop 到 224x224
-                biomed_imgs.append(self.biomed_img_transform(img))
-                # 文本：Tokenize 用户问题 (取 [0] 去除多余的 batch 维度)
-                biomed_txts.append(self.biomed_tokenizer([question_text])[0])
-
-            w, h = img.size
-            # 🚀 替换为 SLAKE 的 max_size
-            scale = min(self.cfg.slake_max_size / max(w, h), 1.0)
-            if scale < 1.0:
-                new_w, new_h = int(w * scale), int(h * scale)
-                img = img.resize((new_w, new_h), Image.BICUBIC)
-
-            # 5. 用同源 processor 精确计算 prompt 长度
-            prompt_inputs = self.processor(
-                text=[text_prompt],
-                images=[img],
-                return_tensors="pt",
-                padding=False,
+            original_image = self._load_rgb_image(
+                image_path
             )
-            prompt_lengths.append(prompt_inputs["input_ids"].shape[1])
 
-            texts.append(text_full)
-            images.append(img)
+            if self.enable_visual_adapter:
+                biomed_image = self.biomed_img_transform(
+                    original_image
+                )
 
-        # 6. 构造正式包含全序列的 batch
-        batch_inputs = self.processor(
-            text=texts,
-            images=images,
+                if not isinstance(
+                    biomed_image,
+                    torch.Tensor,
+                ):
+                    raise TypeError(
+                        "biomed_transform 应返回 torch.Tensor，"
+                        f"当前类型为 {type(biomed_image)}。"
+                    )
+
+                biomed_images.append(
+                    biomed_image
+                )
+
+                # Router 只看原始医学问题，
+                # 不附加 Qwen 的回答格式要求。
+                biomed_questions.append(
+                    raw_question
+                )
+
+            qwen_image = self._resize_for_qwen(
+                original_image
+            )
+
+            prompt_texts.append(prompt_text)
+            full_texts.append(full_text)
+            qwen_images.append(qwen_image)
+
+        # 批量计算 prompt token，避免逐样本调用 Processor。
+        prompt_batch = self.processor(
+            text=prompt_texts,
+            images=qwen_images,
             return_tensors="pt",
             padding=True,
         )
 
-        # =======================================================
-        # 🧠 将 BioMed 特征打包塞入字典，供 Wrapper 劫持提取
-        # =======================================================
-        if self.router_mode == "dynamic":
-            batch_inputs["biomed_image_tensors"] = torch.stack(biomed_imgs)  # shape: [Batch, 3, 224, 224]
-            batch_inputs["biomed_text_tokens"] = torch.stack(biomed_txts)  # shape: [Batch, Context_Len]
+        prompt_lengths = (
+            prompt_batch["attention_mask"]
+            .sum(dim=1)
+        )
 
-        # 7. 构造 labels，并精准 mask 掉 prompt 区域
+        prompt_input_ids = prompt_batch["input_ids"]
+        del prompt_batch
+
+        # 构造包含答案的完整训练 batch。
+        batch_inputs = self.processor(
+            text=full_texts,
+            images=qwen_images,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        # 确认 prompt token 是完整序列的严格前缀。
+        for index, prompt_length in enumerate(
+            prompt_lengths.tolist()
+        ):
+            prompt_ids = prompt_input_ids[
+                index,
+                :prompt_length,
+            ]
+
+            full_prefix_ids = batch_inputs[
+                "input_ids"
+            ][
+                index,
+                :prompt_length,
+            ]
+
+            if not torch.equal(
+                prompt_ids,
+                full_prefix_ids,
+            ):
+                raise RuntimeError(
+                    "Prompt token 与完整 SLAKE 序列前缀不一致，"
+                    f"样本索引：{index}"
+                )
+
+        if self.enable_visual_adapter:
+            batch_inputs["biomed_image_tensors"] = (
+                torch.stack(
+                    biomed_images,
+                    dim=0,
+                )
+            )
+
+            biomed_text_tokens = self.biomed_tokenizer(
+                biomed_questions
+            )
+
+            if not isinstance(
+                biomed_text_tokens,
+                torch.Tensor,
+            ):
+                raise TypeError(
+                    "biomed_tokenizer 应返回 torch.Tensor，"
+                    f"当前类型为 {type(biomed_text_tokens)}。"
+                )
+
+            if (
+                biomed_text_tokens.ndim != 2
+                or biomed_text_tokens.shape[0] != len(batch)
+            ):
+                raise ValueError(
+                    "BioMedCLIP 文本 token 形状错误，"
+                    f"当前形状为 "
+                    f"{tuple(biomed_text_tokens.shape)}，"
+                    f"预期 batch size={len(batch)}。"
+                )
+
+            batch_inputs["biomed_text_tokens"] = (
+                biomed_text_tokens
+                .detach()
+                .cpu()
+            )
+
         labels = batch_inputs["input_ids"].clone()
-        pad_token_id = self.processor.tokenizer.pad_token_id
 
-        for i in range(len(batch)):
-            pad_len = 0
-            if self.processor.tokenizer.padding_side == "left":
-                pad_len = (batch_inputs["attention_mask"][i] == 0).sum().item()
+        # 屏蔽 user prompt、视觉 token 和 assistant 起始标记。
+        for index, prompt_length in enumerate(
+            prompt_lengths.tolist()
+        ):
+            labels[index, :prompt_length] = -100
 
-            mask_end_idx = pad_len + prompt_lengths[i]
-            labels[i, :mask_end_idx] = -100
+        # 只屏蔽真正的 padding。
+        labels.masked_fill_(
+            batch_inputs["attention_mask"].eq(0),
+            -100,
+        )
 
-            # 安全兜底：mask 掉 tokenizer 自动补齐的 padding token
-            if pad_token_id is not None:
-                labels[i][batch_inputs["input_ids"][i] == pad_token_id] = -100
+        valid_token_counts = labels.ne(-100).sum(
+            dim=1
+        )
+
+        if torch.any(valid_token_counts == 0):
+            invalid_indices = (
+                torch.nonzero(
+                    valid_token_counts == 0,
+                    as_tuple=False,
+                )
+                .flatten()
+                .tolist()
+            )
+
+            raise RuntimeError(
+                "部分 SLAKE 样本没有有效答案监督 token，"
+                f"样本索引：{invalid_indices}"
+            )
 
         batch_inputs["labels"] = labels
         return batch_inputs
