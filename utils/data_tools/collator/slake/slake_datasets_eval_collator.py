@@ -1,108 +1,260 @@
+from typing import Any, Sequence
+
 import torch
 from PIL import Image
-from typing import Dict, Any, List, Tuple
 
-# 导入 SLAKE 专属的 Prompt 组装器
-from utils.data_tools.prompt_builder.slake_prompt_builder import build_slake_prompt
+from utils.data_tools.prompt_builder.slake_prompt_builder import (
+    build_slake_prompt,
+)
 
 
 class SLAKEEvalCollator:
     """
-    SLAKE 专属的评估/推理 Collator (Eval Collator)。
+    SLAKE Stage 2 评测 Collator。
 
-    与 Train Collator 的区别：
-    1. 不再生成 labels (不需要计算 loss)。
-    2. 只组装 User 的问题部分 (含图片)，加上 add_generation_prompt=True 让模型准备作答。
-    3. 同步返回 metadata_list (包含 Ground Truth 等)，方便评测脚本进行对账。
+    A0：
+        只构造 Qwen3-VL 输入。
+
+    A1～A5：
+        同时构造 Qwen3-VL 与 BioMedCLIP 输入。
     """
 
-    # 🚀 与 Train Collator 对齐，增加 biomed 工具和 router_mode 初始化
-    def __init__(self, processor, cfg, biomed_transform=None, biomed_tokenizer=None):
+    def __init__(
+        self,
+        processor: Any,
+        cfg: Any,
+        biomed_transform: Any = None,
+        biomed_tokenizer: Any = None,
+    ):
         self.processor = processor
-        self.cfg = cfg
+        self.max_size = int(cfg.slake_max_size)
+        self.instruction_suffix = cfg.slake_instruction_suffix
+        self.enable_visual_adapter = bool(
+            cfg.enable_visual_adapter
+        )
 
-        self.router_mode = getattr(cfg, "router_mode", "fixed")
-        # 接收外部传来的预处理工具
+        if self.processor.tokenizer.padding_side != "left":
+            raise ValueError(
+                "SLAKEEvalCollator 要求 "
+                "processor.tokenizer.padding_side='left'。"
+            )
+
         self.biomed_img_transform = biomed_transform
         self.biomed_tokenizer = biomed_tokenizer
 
-    def __call__(self, batch: List[Dict[str, Any]]) -> Tuple[Dict[str, torch.Tensor], List[Dict[str, Any]]]:
-        texts = []
-        images = []
-        metadata_list = []
+        if self.enable_visual_adapter:
+            if self.biomed_img_transform is None:
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_transform。"
+                )
 
-        # 🎯 用于收集 BioMedCLIP 专属的张量
-        biomed_imgs = []
-        biomed_txts = []
+            if self.biomed_tokenizer is None:
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_tokenizer。"
+                )
 
-        for sample in batch:
-            # 1. 组装提问文本 (拼接 SLAKE 专属 Instruction Suffix)
-            question_text = build_slake_prompt(
-                question=sample['question'],
-                instruction_suffix=self.cfg.slake_instruction_suffix
+    @staticmethod
+    def _load_rgb_image(
+        image_path: str,
+    ) -> Image.Image:
+        try:
+            with Image.open(image_path) as image:
+                return image.convert("RGB")
+        except Exception as exc:
+            raise RuntimeError(
+                f"读取 SLAKE 图像失败：{image_path}"
+            ) from exc
+
+    def _resize_for_qwen(
+        self,
+        image: Image.Image,
+    ) -> Image.Image:
+        width, height = image.size
+        longest_edge = max(width, height)
+
+        if longest_edge <= self.max_size:
+            return image
+
+        scale = self.max_size / longest_edge
+
+        new_width = max(
+            1,
+            round(width * scale),
+        )
+        new_height = max(
+            1,
+            round(height * scale),
+        )
+
+        bicubic = getattr(
+            Image,
+            "Resampling",
+            Image,
+        ).BICUBIC
+
+        return image.resize(
+            (new_width, new_height),
+            resample=bicubic,
+        )
+
+    def __call__(
+        self,
+        batch: Sequence[dict[str, Any]],
+    ):
+        if not batch:
+            raise ValueError(
+                "SLAKEEvalCollator 收到了空 batch。"
             )
 
-            # 2. 构造仅包含 User 提问的消息模板
+        prompt_texts: list[str] = []
+        qwen_images: list[Image.Image] = []
+        metadata_list: list[dict[str, Any]] = []
+
+        biomed_images: list[torch.Tensor] = []
+        biomed_questions: list[str] = []
+
+        for sample in batch:
+            image_path = sample["image_path"]
+
+            raw_question = str(
+                sample["question"]
+            ).strip()
+
+            if not raw_question:
+                raise ValueError(
+                    f"发现空问题，图像路径：{image_path}"
+                )
+
+            # Qwen 使用附带回答要求的完整问题。
+            qwen_question = build_slake_prompt(
+                question=raw_question,
+                instruction_suffix=self.instruction_suffix,
+            )
+
             messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": sample["image_path"]},
-                        {"type": "text", "text": question_text},
+                        {
+                            "type": "image",
+                            "image": image_path,
+                        },
+                        {
+                            "type": "text",
+                            "text": qwen_question,
+                        },
                     ],
                 }
             ]
 
-            # 加上生成引导符 (比如 `<|im_start|>assistant\n`)，准备让模型接话
-            text_prompt = self.processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+            prompt_text = (
+                self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
             )
-            texts.append(text_prompt)
 
-            # 3. 图像读取与自适应缩放
-            with Image.open(sample["image_path"]) as pil_img:
-                img = pil_img.convert("RGB")
+            original_image = self._load_rgb_image(
+                image_path
+            )
 
-            # =======================================================
-            # 🧠 截获原始图片和文本，转化为 BioMed 特征
-            # =======================================================
-            if self.router_mode == "dynamic":
-                biomed_imgs.append(self.biomed_img_transform(img))
-                # 提取纯问题文本给医疗大脑作为路由依据
-                biomed_txts.append(self.biomed_tokenizer([question_text])[0])
+            if self.enable_visual_adapter:
+                biomed_image = self.biomed_img_transform(
+                    original_image
+                )
 
-            w, h = img.size
-            scale = min(self.cfg.slake_max_size / max(w, h), 1.0)
-            if scale < 1.0:
-                new_w, new_h = int(w * scale), int(h * scale)
-                img = img.resize((new_w, new_h), Image.BICUBIC)
-            images.append(img)
+                if not isinstance(
+                    biomed_image,
+                    torch.Tensor,
+                ):
+                    raise TypeError(
+                        "biomed_transform 应返回 Tensor，"
+                        f"当前类型为 {type(biomed_image)}。"
+                    )
 
-            # 4. 组装评估必需的 Metadata (把正确答案、原始题目带到外部去打分)
-            metadata_list.append({
-                "index": sample["index"],
-                "image_path": sample["image_path"],
-                "question": sample["question"],
-                "gt_answer": sample["answer"],
-                "question_type": sample.get("question_type", "UNKNOWN"),
-                "answer_type": sample.get("answer_type", "UNKNOWN"),
-            })
+                biomed_images.append(
+                    biomed_image
+                )
 
-        # 5. 批处理张量化
+                # 与 Stage 2 训练一致：
+                # Router 使用原始医学问题，不附加回答格式指令。
+                biomed_questions.append(
+                    raw_question
+                )
+
+            qwen_image = self._resize_for_qwen(
+                original_image
+            )
+
+            prompt_texts.append(prompt_text)
+            qwen_images.append(qwen_image)
+
+            metadata_list.append(
+                {
+                    "index": sample.get("index"),
+                    "image_path": image_path,
+                    "question": raw_question,
+                    "gt_answer": sample.get(
+                        "answer",
+                        "",
+                    ),
+                    "question_type": sample.get(
+                        "question_type",
+                        "UNKNOWN",
+                    ),
+                    "answer_type": sample.get(
+                        "answer_type",
+                        "UNKNOWN",
+                    ),
+                }
+            )
+
         batch_inputs = self.processor(
-            text=texts,
-            images=images,
+            text=prompt_texts,
+            images=qwen_images,
             return_tensors="pt",
             padding=True,
         )
 
-        # =======================================================
-        # 🧠 将 BioMed 特征打包塞入字典，供 Wrapper 劫持提取
-        # =======================================================
-        if self.router_mode == "dynamic":
-            batch_inputs["biomed_image_tensors"] = torch.stack(biomed_imgs)  # shape: [Batch, 3, 224, 224]
-            batch_inputs["biomed_text_tokens"] = torch.stack(biomed_txts)  # shape: [Batch, Context_Len]
+        if self.enable_visual_adapter:
+            batch_inputs["biomed_image_tensors"] = (
+                torch.stack(
+                    biomed_images,
+                    dim=0,
+                )
+            )
+
+            biomed_text_tokens = self.biomed_tokenizer(
+                biomed_questions
+            )
+
+            if not isinstance(
+                biomed_text_tokens,
+                torch.Tensor,
+            ):
+                raise TypeError(
+                    "biomed_tokenizer 应返回 Tensor，"
+                    f"当前类型为 "
+                    f"{type(biomed_text_tokens)}。"
+                )
+
+            if (
+                biomed_text_tokens.ndim != 2
+                or biomed_text_tokens.shape[0]
+                != len(batch)
+            ):
+                raise ValueError(
+                    "BioMedCLIP 文本 token 形状错误："
+                    f"{tuple(biomed_text_tokens.shape)}"
+                )
+
+            batch_inputs["biomed_text_tokens"] = (
+                biomed_text_tokens
+                .detach()
+                .cpu()
+            )
 
         return batch_inputs, metadata_list

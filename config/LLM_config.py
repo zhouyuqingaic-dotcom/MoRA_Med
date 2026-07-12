@@ -7,7 +7,7 @@ class LLMAPIConfig:
 
     # --- 1. API 基础配置 ---
     base_url: str = os.environ.get("GPT_5_MINI_BASE_URL", "https://api.agicto.cn/v1")
-    gpt_5_mini_key: str = os.environ.get("GPT_5_MINI_API_KEY", "")
+    gpt_5_mini_key: str = os.environ.get("GPT_5_MINI_API_KEY", "sk-yTimtEv3XFcOQUIRTNHUuC2thoKWwtxuYwsezIQ2iiPDQW8i")
     judge_model_name: str = os.environ.get("GPT_5_MINI_MODEL", "gpt-5-mini")
 
     # --- 2. VQA-RAD 专属 LLM 裁判 Prompt ---
