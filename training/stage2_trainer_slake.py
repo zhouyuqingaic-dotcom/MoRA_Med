@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.utils.data import ConcatDataset  # 🚀 降维打击核心工具：缝合数据集
+from torch.utils.data import ConcatDataset,Subset  # 🚀 降维打击核心工具：缝合数据集
 from transformers import Trainer, TrainingArguments, TrainerCallback
 
 # 1. 导入 SLAKE 专属配置类
@@ -31,61 +31,55 @@ def filter_invalid_slake_samples(
     print_rank: int,
 ):
     """
-    在进入 DataLoader 前过滤没有有效监督信号的 SLAKE 样本。
+    通过 Dataset.__getitem__ 检查训练时实际返回的样本，
+    并使用 Subset 保留具有有效监督信号的样本。
 
-    过滤条件：
-    1. question 为空；
-    2. answer 经训练清洗后为空。
-
-    必须在构造 ConcatDataset 和 DDP DataLoader 之前完成，
-    不能在 Collator 中临时丢弃样本。
+    这样过滤的对象与 DataLoader、Collator 实际读取的对象完全一致。
     """
-    original_count = len(dataset.samples)
+    original_count = len(dataset)
 
-    valid_samples = []
+    valid_indices = []
     invalid_samples = []
 
-    for index, row in enumerate(dataset.samples):
-        raw_question = row.get("question", "")
-        raw_answer = row.get("answer", "")
+    for index in range(original_count):
+        # 通过 __getitem__ 获取与 Collator 完全相同的数据结构。
+        sample = dataset[index]
 
-        question_text = (
-            ""
-            if raw_question is None
-            else str(raw_question).strip()
-        )
+        question_text = str(
+            sample.get("question", "")
+        ).strip()
 
-        answer_source = (
-            ""
-            if raw_answer is None
-            else str(raw_answer)
-        )
+        answer_source = str(
+            sample.get("answer", "")
+        ).strip()
 
         answer_text = slake_answer_train_cleaning(
             answer_source
         )
 
-        if not question_text or not answer_text:
-            invalid_samples.append(
-                {
-                    "index": index,
-                    "img_name": row.get("img_name", ""),
-                    "img_id": row.get("img_id", ""),
-                    "question": question_text,
-                    "raw_answer": repr(raw_answer),
-                    "cleaned_answer": repr(answer_text),
-                }
-            )
+        if question_text and answer_text:
+            valid_indices.append(index)
             continue
 
-        valid_samples.append(row)
+        invalid_samples.append(
+            {
+                "index": index,
+                "image_path": sample.get("image_path", ""),
+                "question": question_text,
+                "raw_answer": repr(answer_source),
+                "cleaned_answer": repr(answer_text),
+            }
+        )
 
-    dataset.samples = valid_samples
+    filtered_dataset = Subset(
+        dataset,
+        valid_indices,
+    )
 
     ddp_print(
         f"[SLAKE 数据清理] {split_name}: "
         f"原始={original_count}, "
-        f"保留={len(valid_samples)}, "
+        f"保留={len(filtered_dataset)}, "
         f"删除={len(invalid_samples)}",
         print_rank=print_rank,
     )
@@ -95,12 +89,11 @@ def filter_invalid_slake_samples(
 
         ddp_print(
             f"[SLAKE 数据清理] {split_name} "
-            f"无效样本示例（最多 10 条）：\n"
+            "无效样本示例（最多 10 条）：\n"
             + "\n".join(
                 (
                     f"  index={item['index']}, "
-                    f"img_name={item['img_name']}, "
-                    f"img_id={item['img_id']}, "
+                    f"image_path={item['image_path']}, "
                     f"question={item['question']!r}, "
                     f"raw_answer={item['raw_answer']}, "
                     f"cleaned_answer={item['cleaned_answer']}"
@@ -109,6 +102,10 @@ def filter_invalid_slake_samples(
             ),
             print_rank=print_rank,
         )
+
+    return filtered_dataset
+
+
 
 def get_visual_adapter(model):
     """
@@ -257,13 +254,13 @@ def main():
 
     # 施加黑魔法：拼装成将近 1.2 万条数据的训练集
     # 在构造 ConcatDataset 和 DDP DataLoader 前过滤无效监督样本。
-    filter_invalid_slake_samples(
+    train_subset = filter_invalid_slake_samples(
         dataset=train_subset,
         split_name="train",
         print_rank=cfg.print_rank,
     )
 
-    filter_invalid_slake_samples(
+    val_subset = filter_invalid_slake_samples(
         dataset=val_subset,
         split_name="validate",
         print_rank=cfg.print_rank,
