@@ -65,7 +65,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A5"
+    ablation_id: str = "A3" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -101,7 +101,8 @@ class TrainConfig:
     mimic_cxr_max_size: int = 1024
 
     # Smoke test 用；None 表示全量训练
-    max_mimic_cxr_train_samples: Optional[int] = None
+    # max_mimic_cxr_train_samples: Optional[int] = None
+    max_mimic_cxr_train_samples: Optional[int] = 500
 
     # =========================================================
     # 3. Qwen3-VL 模型与量化配置
@@ -226,12 +227,6 @@ class TrainConfig:
     residual_norm_eps: float = 1e-6
     residual_norm_ratio_clip: Optional[float] = 10.0
 
-    # =========================================================
-    # 8. 兼容字段
-    # =========================================================
-    # 这个字段只用于兼容可能仍然读取 cfg.router_mode 的旧 collator/日志代码。
-    # 新版 trainer/wrapper 不再依赖它。
-    router_mode: str = "dynamic"
 
     def __post_init__(self):
         # =====================================================
@@ -247,78 +242,111 @@ class TrainConfig:
         self.ablation_id = aid
 
         if aid == "A0":
+            # -------------------------------------------------
             # Qwen3-VL + LoRA
+            # 不启用 RoMA-Net visual adapter。
+            # -------------------------------------------------
             self.enable_visual_adapter = False
 
-            # 这些字段不会实际使用，但保持合法值
+            # 以下配置在 A0 中不会被真正使用。
+            # 保留合法值是为了统一日志输出和配置检查。
             self.scale_mode = "learned"
+
             self.gate_mode = "fixed"
             self.fixed_gate = 1.0
+
             self.lambda_mode = "fixed"
             self.fixed_lambda = 0.0
+
             self.use_rms_norm = False
-            self.router_mode = "none"
 
         elif aid == "A1":
-            # v2 fixed-alpha, w/o soft gate
+            # -------------------------------------------------
+            # 学习多尺度路由 π，但不使用 soft gate。
+            # residual 强度使用固定 alpha/lambda。
+            # -------------------------------------------------
             self.enable_visual_adapter = True
+
             self.scale_mode = "learned"
+
             self.gate_mode = "fixed"
             self.fixed_gate = 1.0
+
             self.lambda_mode = "fixed"
             self.fixed_lambda = 0.1
+
             self.use_rms_norm = True
-            self.router_mode = "dynamic"
 
         elif aid == "A2":
-            # v2 learnable-lambda, w/o soft gate
+            # -------------------------------------------------
+            # 不使用 soft gate，但学习全局 residual scale λ。
+            # -------------------------------------------------
             self.enable_visual_adapter = True
+
             self.scale_mode = "learned"
+
             self.gate_mode = "fixed"
             self.fixed_gate = 1.0
+
             self.lambda_mode = "learnable"
             self.lambda_init = 0.1
             self.lambda_max = 1.0
+
             self.use_rms_norm = True
-            self.router_mode = "dynamic"
 
         elif aid == "A3":
-            # v2 with soft gate, fixed-alpha
+            # -------------------------------------------------
+            # 使用 soft gate，但 residual scale λ 固定。
+            # -------------------------------------------------
             self.enable_visual_adapter = True
+
             self.scale_mode = "learned"
+
             self.gate_mode = "learned"
+
             self.lambda_mode = "fixed"
             self.fixed_lambda = 0.1
+
             self.use_rms_norm = True
-            self.router_mode = "dynamic"
 
         elif aid == "A4":
-            # Full w/o RMS
+            # -------------------------------------------------
+            # 完整 RoMA-Net V2-lite，但不使用 RMS normalization。
+            # -------------------------------------------------
             self.enable_visual_adapter = True
+
             self.scale_mode = "learned"
+
             self.gate_mode = "learned"
+
             self.lambda_mode = "learnable"
             self.lambda_init = 0.1
             self.lambda_max = 1.0
+
             self.use_rms_norm = False
-            self.router_mode = "dynamic"
 
         elif aid == "A5":
-            # Full RoMA-Net V2-lite
+            # -------------------------------------------------
+            # 完整 RoMA-Net V2-lite。
+            # -------------------------------------------------
             self.enable_visual_adapter = True
+
             self.scale_mode = "learned"
+
             self.gate_mode = "learned"
+
             self.lambda_mode = "learnable"
             self.lambda_init = 0.1
             self.lambda_max = 1.0
+
             self.use_rms_norm = True
-            self.router_mode = "dynamic"
 
         else:
             raise ValueError(
-                f"不支持的 ablation_id: {self.ablation_id}. "
-                f"可选: A0, A1, A2, A3, A4, A5"
+                f"不支持的 ablation_id: {self.ablation_id}。"
+                "可选值为 A0、A1、A2、A3、A4、A5。"
             )
+
 
         # =====================================================
         # 3. 模式合法性检查

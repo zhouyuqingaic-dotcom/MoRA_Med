@@ -27,14 +27,13 @@ from utils.ddp.ddp_utils import ddp_print
 
 def set_seed(seed: int):
     """
-    全局随机种子设置，保证多卡 DDP 环境下每次初始化的权重和数据采样顺序一致。
+    设置全局随机种子，尽量保证不同运行之间具有可复现性。
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # 保证 cuDNN 算子确定性
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -94,11 +93,9 @@ def main():
         cache_prefix=cfg.mimic_cxr_cache_prefix,
     )
 
-    if (
-        hasattr(cfg, "max_mimic_cxr_train_samples")
-        and cfg.max_mimic_cxr_train_samples is not None
-    ):
-        train_dataset.samples = train_dataset.samples[: cfg.max_mimic_cxr_train_samples]
+    if cfg.max_mimic_cxr_train_samples is not None:
+        train_dataset.samples = train_dataset.samples[:cfg.max_mimic_cxr_train_samples]
+
         ddp_print(
             f"⚠️ 已截断数据集用于调试，当前样本量: {len(train_dataset)}",
             print_rank=cfg.print_rank,
@@ -230,8 +227,14 @@ def main():
     # ==========================================
     # 6. 配置 Hugging Face TrainingArguments
     # ==========================================
+
     ddp_print(
         f"\n🔥 启动 Hugging Face Trainer... 设定轮数: {cfg.num_train_epochs}",
+        print_rank=cfg.print_rank,
+    )
+
+    ddp_print(
+        "    DDP 配置：find_unused_parameters=False",
         print_rank=cfg.print_rank,
     )
 
@@ -252,18 +255,25 @@ def main():
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
 
-        bf16=(cfg.torch_dtype == "bfloat16" or cfg.torch_dtype == torch.bfloat16),
-        fp16=(cfg.torch_dtype == "float16" or cfg.torch_dtype == torch.float16),
+        bf16=(
+                cfg.torch_dtype == "bfloat16"
+                or cfg.torch_dtype == torch.bfloat16
+        ),
+        fp16=(
+                cfg.torch_dtype == "float16"
+                or cfg.torch_dtype == torch.float16
+        ),
 
         dataloader_num_workers=cfg.dataloader_num_workers,
 
-        # 这里保持 False，因为 wrapper 里 prepare_model_for_kbit_training 已经处理过
+        # wrapper 中的 prepare_model_for_kbit_training 已处理梯度检查点。
         gradient_checkpointing=False,
 
-        # 必须 False，否则 biomed_image_tensors / biomed_text_tokens 会被 Trainer 丢掉
+        # 必须为 False，否则 Trainer 可能删除 BioMedCLIP 输入。
         remove_unused_columns=False,
 
-        # 你的 adapter / LoRA 场景建议保持 False
+        # fixed 分支已在 fusion module 中通过 requires_grad=False 冻结。
+        # 因此剩余可训练参数均应参与当前计算图，不需要额外搜索 unused parameters。
         ddp_find_unused_parameters=False,
 
         report_to="none",

@@ -23,6 +23,7 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
     - RMS residual norm on/off
     """
 
+
     def __init__(
         self,
         hidden_dim: int,
@@ -107,8 +108,14 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
             torch.tensor(safe_logit(lambda_ratio), dtype=torch.float32)
         )
 
-        self._reset_router_parameters(gate_init=gate_init)
+        # 首先检查消融模式是否合法。
         self._validate_modes()
+
+        # 初始化路由 head。
+        self._reset_router_parameters(gate_init=gate_init)
+
+        # 冻结当前消融模式下不会参与训练的分支。
+        self._freeze_disabled_branches()
 
     def _validate_modes(self):
         if self.scale_mode not in {"learned", "fixed"}:
@@ -128,6 +135,47 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
         # 初始 gate 为 gate_init
         nn.init.zeros_(self.gate_head.weight)
         nn.init.constant_(self.gate_head.bias, safe_logit(gate_init))
+
+    def _freeze_disabled_branches(self):
+        """
+        根据当前消融模式冻结不参与前向计算的参数。
+
+        这样做有三个作用：
+        1. trainable parameter 统计更加准确；
+        2. 优化器不会收集无效参数；
+        3. 避免 DDP 将固定分支识别为 unused parameters。
+        """
+
+        # -------------------------------------------------
+        # 固定尺度路由时，不训练 scale head。
+        # -------------------------------------------------
+        if self.scale_mode == "fixed":
+            self.scale_head.requires_grad_(False)
+
+        # -------------------------------------------------
+        # 固定 residual gate 时，不训练 gate head。
+        # -------------------------------------------------
+        if self.gate_mode == "fixed":
+            self.gate_head.requires_grad_(False)
+
+        # -------------------------------------------------
+        # 固定 lambda 时，不训练 lambda_a。
+        #
+        # 保留 lambda_a 这个参数对象，可以维持不同消融实验之间
+        # state_dict 的字段结构一致，只关闭它的梯度即可。
+        # -------------------------------------------------
+        if self.lambda_mode == "fixed":
+            self.lambda_a.requires_grad_(False)
+
+        # -------------------------------------------------
+        # router_backbone 同时为 scale head 和 gate head 服务。
+        #
+        # 只有当 scale 和 gate 都是 fixed 时，
+        # router_backbone 才完全不参与任何可学习路由分支，
+        # 此时应一并冻结。
+        # -------------------------------------------------
+        if self.scale_mode == "fixed" and self.gate_mode == "fixed":
+            self.router_backbone.requires_grad_(False)
 
     def _get_scale_weights(self, route_hidden: torch.Tensor) -> torch.Tensor:
         if self.scale_mode == "learned":
