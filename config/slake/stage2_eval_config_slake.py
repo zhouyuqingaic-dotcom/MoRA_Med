@@ -39,6 +39,34 @@ class Stage2EvalConfig(Stage2TrainConfig):
     per_device_eval_batch_size: int = 4
     dataloader_num_workers: int = 4
 
+    # =========================================================
+    # 推理探针
+    # =========================================================
+    # 可选：
+    # normal         正常 A5
+    # adapter_off    强制关闭 residual
+    # gate_1         强制 g=1
+    # lambda_0_5     强制 lambda=0.5
+    # lambda_1_0     强制 lambda=1.0
+    # uniform_scale  强制四专家权重均为 0.25
+    probe_mode: str = "drop_f7_renorm" #"gate_1" #"uniform_scale" #"lambda_x1_25" #"scale_const_mean" #"gate_const_mean" #"lambda_x0_75"
+
+    # 来自 normal / final_weights 的统计结果。
+    # 仅用于诊断，不用于正式模型报告。
+    probe_gate_value: float = 0.552490
+
+    probe_scale_weights: tuple[
+        float,
+        float,
+        float,
+        float,
+    ] = (
+        0.299964,
+        0.236155,
+        0.231944,
+        0.231936,
+    )
+
     def __post_init__(self):
         # 先由训练配置生成完全一致的 A0～A5 结构和 Stage 2 路径。
         super().__post_init__()
@@ -61,7 +89,28 @@ class Stage2EvalConfig(Stage2TrainConfig):
             run_name,
         )
 
+        valid_probe_modes = {
+            "normal",
+            "adapter_off",
+            "gate_const_mean",
+            "scale_const_mean",
+            "gate_1",
+            "lambda_x0_75",
+            "lambda_x1_25",
+            "uniform_scale",
+            "drop_f7_renorm",
+        }
+
+        if self.probe_mode not in valid_probe_modes:
+            raise ValueError(
+                f"不支持的 probe_mode={self.probe_mode}，"
+                f"可选值为：{sorted(valid_probe_modes)}"
+            )
+
+
         print("\n" + "=" * 60)
+        print(f"推理探针模式：{self.probe_mode}")
+
         print(
             f"SLAKE Stage 2 评测配置 | "
             f"消融={self.ablation_id}"
@@ -79,3 +128,4 @@ class Stage2EvalConfig(Stage2TrainConfig):
             f"{self.output_dir}"
         )
         print("=" * 60 + "\n")
+

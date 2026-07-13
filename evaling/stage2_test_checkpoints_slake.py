@@ -55,6 +55,211 @@ def get_visual_adapter(model):
         return None
 
 
+def apply_inference_probe(
+    adapter_module,
+    cfg,
+):
+    """
+    对已经训练完成的 visual adapter 施加推理诊断探针。
+
+    这些探针只改变当前推理过程：
+    - 不修改 checkpoint；
+    - 不修改 state_dict；
+    - 不代表重新训练后的真实性能。
+    """
+    probe_mode = cfg.probe_mode
+
+    if probe_mode == "normal":
+        return
+
+    if probe_mode == "adapter_off":
+        # P1：令 g=0，完全关闭 residual branch。
+        def forced_gate_zero(self, route_hidden):
+            return torch.zeros(
+                (route_hidden.size(0), 1),
+                device=route_hidden.device,
+                dtype=route_hidden.dtype,
+            )
+
+        adapter_module._get_soft_gate = types.MethodType(
+            forced_gate_zero,
+            adapter_module,
+        )
+
+    elif probe_mode == "gate_1":
+        # P2：强制 g=1，保留 learned π 和 learned λ。
+        def forced_gate_one(self, route_hidden):
+            return torch.ones(
+                (route_hidden.size(0), 1),
+                device=route_hidden.device,
+                dtype=route_hidden.dtype,
+            )
+
+        adapter_module._get_soft_gate = types.MethodType(
+            forced_gate_one,
+            adapter_module,
+        )
+
+    elif probe_mode == "lambda_0_5":
+        # P3：强制 lambda=0.5。
+        def forced_lambda_half(self, x):
+            return torch.tensor(
+                0.5,
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+        adapter_module._get_lambda = types.MethodType(
+            forced_lambda_half,
+            adapter_module,
+        )
+
+    elif probe_mode == "lambda_1_0":
+        # P4：强制 lambda=1.0。
+        def forced_lambda_one(self, x):
+            return torch.tensor(
+                1.0,
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+        adapter_module._get_lambda = types.MethodType(
+            forced_lambda_one,
+            adapter_module,
+        )
+
+    elif probe_mode == "uniform_scale":
+        # P5：强制 π1=π3=π5=π7=0.25。
+        def forced_uniform_scale(self, route_hidden):
+            return torch.full(
+                (route_hidden.size(0), 4),
+                fill_value=0.25,
+                device=route_hidden.device,
+                dtype=route_hidden.dtype,
+            )
+
+        adapter_module._get_scale_weights = types.MethodType(
+            forced_uniform_scale,
+            adapter_module,
+        )
+        
+    elif probe_mode == "gate_const_mean":
+        # 保持正常模式的平均残差强度，
+        # 只移除 gate 的样本级动态变化。
+        def forced_gate_mean(self, route_hidden):
+            return torch.full(
+                (route_hidden.size(0), 1),
+                fill_value=cfg.probe_gate_value,
+                device=route_hidden.device,
+                dtype=route_hidden.dtype,
+            )
+
+        adapter_module._get_soft_gate = types.MethodType(
+            forced_gate_mean,
+            adapter_module,
+        )
+        
+    elif probe_mode == "scale_const_mean":
+        # 保留 learned router 的平均专家偏好，
+        # 只移除每个样本之间的 routing 变化。
+        fixed_weights = torch.tensor(
+            cfg.probe_scale_weights,
+            dtype=torch.float32,
+        )
+
+        fixed_weights = (
+            fixed_weights
+            / fixed_weights.sum()
+        )
+
+        def forced_mean_scale(self, route_hidden):
+            weights = fixed_weights.to(
+                device=route_hidden.device,
+                dtype=route_hidden.dtype,
+            )
+
+            return weights.unsqueeze(0).expand(
+                route_hidden.size(0),
+                -1,
+            )
+
+        adapter_module._get_scale_weights = types.MethodType(
+            forced_mean_scale,
+            adapter_module,
+        )
+
+    elif probe_mode in {
+        "lambda_x0_75",
+        "lambda_x1_25",
+    }:
+        # 在 checkpoint 已学习到的 lambda 附近做局部敏感性扫描。
+        # 不直接覆盖绝对值，保留模型学到的 lambda，
+        # 只将其乘以 0.75 或 1.25。
+        lambda_factor = (
+            0.75
+            if probe_mode == "lambda_x0_75"
+            else 1.25
+        )
+
+        original_get_lambda = (
+            adapter_module._get_lambda
+        )
+
+        def scaled_lambda(self, x):
+            return (
+                    original_get_lambda(x)
+                    * lambda_factor
+            )
+
+        adapter_module._get_lambda = types.MethodType(
+            scaled_lambda,
+            adapter_module,
+        )
+
+    elif probe_mode == "drop_f7_renorm":
+        # 保留当前 checkpoint 学到的 F1/F3/F5 动态权重，
+        # 去掉新增的 F7 专家权重并重新归一化。
+        #
+        # 这是推理诊断，不代表三尺度重新训练后的最终性能。
+        original_get_scale_weights = (
+            adapter_module._get_scale_weights
+        )
+
+        def drop_f7_and_renormalize(
+                self,
+                route_hidden,
+        ):
+            weights = original_get_scale_weights(
+                route_hidden
+            ).clone()
+
+            # F1、F3、F5、F7 中最后一维对应 F7。
+            weights[:, 3] = 0.0
+
+            denominator = weights.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-12)
+
+            return weights / denominator
+
+        adapter_module._get_scale_weights = (
+            types.MethodType(
+                drop_f7_and_renormalize,
+                adapter_module,
+            )
+        )
+
+
+    else:
+        raise ValueError(
+            f"未知 probe_mode：{probe_mode}"
+        )
+
+    print(
+        f"已启用推理探针：{probe_mode}"
+    )
+
 def build_model_for_checkpoint(
     weights_path,
     loader,
@@ -223,6 +428,22 @@ def evaluate_single_checkpoint(
 
     model, base_model = built_model
 
+    adapter_module = None
+
+    if cfg.enable_visual_adapter:
+        adapter_module = get_visual_adapter(model)
+
+        if adapter_module is None:
+            raise RuntimeError(
+                "启用了 visual adapter，"
+                "但没有找到 visual.res_adapter。"
+            )
+
+        apply_inference_probe(
+            adapter_module=adapter_module,
+            cfg=cfg,
+        )
+
     vision_tower = (
         model.base_model
         .model
@@ -292,6 +513,11 @@ def evaluate_single_checkpoint(
     }
     all_records = []
 
+    routing_weight_records = []
+    gate_records = []
+    lambda_records = []
+    effective_scale_records = []
+
     with torch.no_grad():
         for batch_inputs, metadata_list in tqdm(
             test_loader,
@@ -349,6 +575,67 @@ def evaluate_single_checkpoint(
                 **inputs,
                 **generation_kwargs,
             )
+
+            if (
+                    cfg.enable_visual_adapter
+                    and adapter_module is not None
+            ):
+                routing_weights = getattr(
+                    adapter_module,
+                    "latest_routing_weights",
+                    None,
+                )
+                soft_gate = getattr(
+                    adapter_module,
+                    "latest_soft_gate",
+                    None,
+                )
+                lambda_value = getattr(
+                    adapter_module,
+                    "latest_lambda",
+                    None,
+                )
+
+                if (
+                        routing_weights is not None
+                        and soft_gate is not None
+                        and lambda_value is not None
+                ):
+                    routing_weights_cpu = (
+                        routing_weights
+                        .detach()
+                        .float()
+                        .cpu()
+                    )
+
+                    gate_cpu = (
+                        soft_gate
+                        .detach()
+                        .float()
+                        .reshape(-1)
+                        .cpu()
+                    )
+
+                    lambda_scalar = float(
+                        lambda_value
+                        .detach()
+                        .float()
+                        .mean()
+                        .cpu()
+                    )
+
+                    routing_weight_records.append(
+                        routing_weights_cpu
+                    )
+                    gate_records.append(
+                        gate_cpu
+                    )
+                    lambda_records.append(
+                        lambda_scalar
+                    )
+                    effective_scale_records.append(
+                        gate_cpu * lambda_scalar
+                    )
 
             if cfg.enable_visual_adapter:
                 # 当前 batch 完成后立即清空，防止特征残留到下一批。
@@ -425,6 +712,93 @@ def evaluate_single_checkpoint(
                         ),
                     }
                 )
+
+    if gate_records:
+        all_gates = torch.cat(
+            gate_records,
+            dim=0,
+        )
+
+        all_effective_scales = torch.cat(
+            effective_scale_records,
+            dim=0,
+        )
+
+        all_routing_weights = torch.cat(
+            routing_weight_records,
+            dim=0,
+        )
+
+        mean_lambda = (
+                sum(lambda_records)
+                / len(lambda_records)
+        )
+
+        gate_quantiles = torch.quantile(
+            all_gates,
+            torch.tensor([0.1, 0.5, 0.9]),
+        )
+
+        effective_quantiles = torch.quantile(
+            all_effective_scales,
+            torch.tensor([0.1, 0.5, 0.9]),
+        )
+
+        safe_weights = all_routing_weights.clamp_min(
+            1e-12
+        )
+
+        routing_entropy = -(
+                safe_weights
+                * safe_weights.log()
+        ).sum(dim=-1)
+
+        mean_scale_weights = (
+            all_routing_weights.mean(dim=0)
+        )
+
+        print("\n" + "=" * 70)
+        print(
+            f"路由诊断 | checkpoint="
+            f"{os.path.basename(weights_path)} "
+            f"| probe={cfg.probe_mode}"
+        )
+        print("=" * 70)
+
+        print(f"lambda mean：{mean_lambda:.6f}")
+
+        print(
+            "gate："
+            f"mean={all_gates.mean().item():.6f}, "
+            f"std={all_gates.std().item():.6f}, "
+            f"P10={gate_quantiles[0].item():.6f}, "
+            f"P50={gate_quantiles[1].item():.6f}, "
+            f"P90={gate_quantiles[2].item():.6f}"
+        )
+
+        print(
+            "lambda * gate："
+            f"mean={all_effective_scales.mean().item():.6f}, "
+            f"P10={effective_quantiles[0].item():.6f}, "
+            f"P50={effective_quantiles[1].item():.6f}, "
+            f"P90={effective_quantiles[2].item():.6f}"
+        )
+
+        print(
+            "平均专家权重："
+            f"F1={mean_scale_weights[0].item():.6f}, "
+            f"F3={mean_scale_weights[1].item():.6f}, "
+            f"F5={mean_scale_weights[2].item():.6f}, "
+            f"F7={mean_scale_weights[3].item():.6f}"
+        )
+
+        print(
+            "路由 entropy："
+            f"mean={routing_entropy.mean().item():.6f}, "
+            f"归一化="
+            f"{routing_entropy.mean().item() / 1.386294:.6f}"
+        )
+        print("=" * 70)
 
     # 本地生成完成后释放当前 checkpoint 模型显存。
     del model
@@ -532,6 +906,15 @@ def main():
         checkpoint_dirs.append(
             final_weights_path
         )
+    #零时修改，只跑final
+    if not os.path.isdir(final_weights_path):
+        raise FileNotFoundError(
+            f"找不到 final_weights：{final_weights_path}"
+        )
+
+    checkpoint_dirs = [
+        final_weights_path
+    ]
 
     if not checkpoint_dirs:
         print(
