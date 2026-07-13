@@ -108,16 +108,3 @@ class VisualAdapter_F5(BasicVisualAdapter):
             dilation=2,
         )
 
-
-class VisualAdapter_F7(BasicVisualAdapter):
-    """
-    Long-range local residual expert, RF=7。
-    通过 kernel=3, dilation=3 实现。
-    """
-    def __init__(self, hidden_dim: int, r: int = 16):
-        super().__init__(
-            hidden_dim=hidden_dim,
-            r=r,
-            kernel_size=3,
-            dilation=3,
-        )

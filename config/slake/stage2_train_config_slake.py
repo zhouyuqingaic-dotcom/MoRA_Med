@@ -136,10 +136,9 @@ class Stage2TrainConfig:
     scale_mode: str = "learned"
     fixed_scale_weights: list[float] = field(
         default_factory=lambda: [
-            0.25,
-            0.25,
-            0.25,
-            0.25,
+            1.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
         ]
     )
 
@@ -157,6 +156,12 @@ class Stage2TrainConfig:
     residual_norm_ratio_clip: Optional[float] = 10.0
 
     def __post_init__(self):
+        if len(self.fixed_scale_weights) != 3:
+            raise ValueError(
+                "fixed_scale_weights 必须包含 3 个值，"
+                "对应 F1/F3/F5。"
+            )
+
         aid = self.ablation_id.upper()
         self.ablation_id = aid
 
@@ -230,6 +235,7 @@ class Stage2TrainConfig:
         stage1_experiment_dir = (
             f"Stage1_MIMIC_CXR_"
             f"{self.ablation_id}_"
+            f"Experts-F1-F3-F5_"
             f"Scale-{self.scale_mode}_"
             f"Gate-{self.gate_mode}_"
             f"Lambda-{self.lambda_mode}_"
@@ -249,6 +255,7 @@ class Stage2TrainConfig:
         stage2_experiment_dir = (
             f"Stage2_SLAKE_"
             f"{self.ablation_id}_"
+            f"Experts-F1-F3-F5_"
             f"Scale-{self.scale_mode}_"
             f"Gate-{self.gate_mode}_"
             f"Lambda-{self.lambda_mode}_"

@@ -65,7 +65,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A3" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -101,8 +101,7 @@ class TrainConfig:
     mimic_cxr_max_size: int = 1024
 
     # Smoke test 用；None 表示全量训练
-    # max_mimic_cxr_train_samples: Optional[int] = None
-    max_mimic_cxr_train_samples: Optional[int] = 500
+    max_mimic_cxr_train_samples: Optional[int] = None
 
     # =========================================================
     # 3. Qwen3-VL 模型与量化配置
@@ -185,12 +184,16 @@ class TrainConfig:
     # -----------------------------
     # Scale routing
     # -----------------------------
-    # learned: BioMedCLIP-aware router 学习 π1/π3/π5/π7
+    # learned: BioMedCLIP-aware router 学习 π1/π3/π5
     # fixed: 使用 fixed_scale_weights
     scale_mode: str = "learned"
 
     fixed_scale_weights: list[float] = field(
-        default_factory=lambda: [0.25, 0.25, 0.25, 0.25]
+        default_factory=lambda: [
+            1.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+        ]
     )
 
     # -----------------------------
@@ -360,8 +363,11 @@ class TrainConfig:
         if self.lambda_mode not in {"learnable", "fixed"}:
             raise ValueError(f"不支持的 lambda_mode: {self.lambda_mode}")
 
-        if len(self.fixed_scale_weights) != 4:
-            raise ValueError("fixed_scale_weights 必须包含 4 个值，对应 F1/F3/F5/F7。")
+        if len(self.fixed_scale_weights) != 3:
+            raise ValueError(
+                "fixed_scale_weights 必须包含 3 个值，"
+                "对应 F1/F3/F5。"
+            )
 
         if self.lambda_max <= 0:
             raise ValueError("lambda_max 必须大于 0。")
@@ -386,6 +392,7 @@ class TrainConfig:
             f"{self.output_root}/"
             f"Stage1_MIMIC_CXR_"
             f"{self.ablation_id}_"
+            f"Experts-F1-F3-F5_"
             f"Scale-{self.scale_mode}_"
             f"Gate-{self.gate_mode}_"
             f"Lambda-{self.lambda_mode}_"

@@ -1,4 +1,5 @@
 import glob
+import math
 import os
 import types
 
@@ -103,7 +104,7 @@ def build_model_for_checkpoint(
         # Router backbone。
         router_hidden_dim=cfg.router_hidden_dim,
 
-        # 四尺度 routing。
+        # 三尺度 F1/F3/F5 routing
         scale_mode=cfg.scale_mode,
         fixed_scale_weights=cfg.fixed_scale_weights,
 
@@ -223,6 +224,21 @@ def evaluate_single_checkpoint(
 
     model, base_model = built_model
 
+    # 获取三尺度 RoMA-Net visual adapter，
+    # 用于读取推理过程中产生的路由权重。
+    adapter_module = None
+
+    if cfg.enable_visual_adapter:
+        adapter_module = get_visual_adapter(
+            model
+        )
+
+        if adapter_module is None:
+            raise RuntimeError(
+                "启用了 visual adapter，"
+                "但没有找到 visual.res_adapter。"
+            )
+
     vision_tower = (
         model.base_model
         .model
@@ -291,12 +307,38 @@ def evaluate_single_checkpoint(
         "open_correct": 0,
     }
     all_records = []
+    # ---------------------------------------------------------
+    # 三尺度路由诊断记录
+    # ---------------------------------------------------------
+    # routing_weight_records:
+    #   每个图文对的 F1/F3/F5 权重。
+    #
+    # gate_records:
+    #   每个图文对的 soft residual gate。
+    #
+    # lambda_records:
+    #   当前 checkpoint 的全局 lambda。
+    #   为方便逐样本对齐，会在每个 batch 内复制。
+    #
+    # effective_scale_records:
+    #   每个图文对实际使用的 lambda * gate。
+    routing_weight_records = []
+    gate_records = []
+    lambda_records = []
+    effective_scale_records = []
 
     with torch.no_grad():
         for batch_inputs, metadata_list in tqdm(
             test_loader,
             desc="Local Inference",
         ):
+            # 当前 batch 的逐样本诊断信息。
+            # A0 或未启用 visual adapter 时保持为 None。
+            batch_routing_weights = None
+            batch_gates = None
+            batch_lambdas = None
+            batch_effective_scales = None
+
             inputs = {
                 key: (
                     value.to(model_device)
@@ -350,8 +392,141 @@ def evaluate_single_checkpoint(
                 **generation_kwargs,
             )
 
+            # =========================================================
+            # 收集当前 batch 的三尺度 routing / gate / lambda
+            # =========================================================
+            # 必须在清空 BioMedCLIP 缓存之前完成。
+            if (
+                    cfg.enable_visual_adapter
+                    and adapter_module is not None
+            ):
+                routing_weights = getattr(
+                    adapter_module,
+                    "latest_routing_weights",
+                    None,
+                )
+                soft_gate = getattr(
+                    adapter_module,
+                    "latest_soft_gate",
+                    None,
+                )
+                lambda_value = getattr(
+                    adapter_module,
+                    "latest_lambda",
+                    None,
+                )
+
+                if routing_weights is None:
+                    raise RuntimeError(
+                        "没有获取到 latest_routing_weights，"
+                        "请确认 Fusion 前向是否保存了该属性。"
+                    )
+
+                if soft_gate is None:
+                    raise RuntimeError(
+                        "没有获取到 latest_soft_gate，"
+                        "请确认 Fusion 前向是否保存了该属性。"
+                    )
+
+                if lambda_value is None:
+                    raise RuntimeError(
+                        "没有获取到 latest_lambda，"
+                        "请确认 Fusion 前向是否保存了该属性。"
+                    )
+
+                batch_size = len(metadata_list)
+
+                # -----------------------------------------------------
+                # 路由权重：[B, 3]，分别对应 F1/F3/F5
+                # -----------------------------------------------------
+                batch_routing_weights = (
+                    routing_weights
+                    .detach()
+                    .float()
+                    .cpu()
+                )
+
+                if (
+                        batch_routing_weights.ndim != 2
+                        or batch_routing_weights.shape
+                        != (batch_size, 3)
+                ):
+                    raise RuntimeError(
+                        "三尺度 routing weights 形状错误："
+                        f"当前为 "
+                        f"{tuple(batch_routing_weights.shape)}，"
+                        f"预期为 ({batch_size}, 3)。"
+                    )
+
+                # -----------------------------------------------------
+                # 样本级 gate：[B]
+                # -----------------------------------------------------
+                batch_gates = (
+                    soft_gate
+                    .detach()
+                    .float()
+                    .reshape(-1)
+                    .cpu()
+                )
+
+                if batch_gates.shape != (batch_size,):
+                    raise RuntimeError(
+                        "residual gate 形状错误："
+                        f"当前为 {tuple(batch_gates.shape)}，"
+                        f"预期为 ({batch_size},)。"
+                    )
+
+                # -----------------------------------------------------
+                # 全局共享 lambda：标量
+                # -----------------------------------------------------
+                lambda_cpu = (
+                    lambda_value
+                    .detach()
+                    .float()
+                    .cpu()
+                )
+
+                if lambda_cpu.numel() != 1:
+                    raise RuntimeError(
+                        "当前设计中的 lambda 应为标量，"
+                        f"实际形状为 "
+                        f"{tuple(lambda_cpu.shape)}。"
+                    )
+
+                lambda_scalar = float(
+                    lambda_cpu.item()
+                )
+
+                # lambda 是全局共享参数。
+                # 这里复制为 [B]，只是为了与每个样本一一对应。
+                batch_lambdas = torch.full(
+                    (batch_size,),
+                    fill_value=lambda_scalar,
+                    dtype=torch.float32,
+                )
+
+                # 每个图文对实际使用的残差系数 λg。
+                batch_effective_scales = (
+                        batch_gates
+                        * batch_lambdas
+                )
+
+                routing_weight_records.append(
+                    batch_routing_weights
+                )
+                gate_records.append(
+                    batch_gates
+                )
+                lambda_records.append(
+                    batch_lambdas
+                )
+                effective_scale_records.append(
+                    batch_effective_scales
+                )
+
             if cfg.enable_visual_adapter:
-                # 当前 batch 完成后立即清空，防止特征残留到下一批。
+                # 当前 batch 完成后立即清空，
+                # 防止 BioMedCLIP 特征残留到下一批。
                 vision_tower.current_biomed_img_feat = None
                 vision_tower.current_biomed_txt_feat = None
 
@@ -412,6 +587,12 @@ def evaluate_single_checkpoint(
 
                 all_records.append(
                     {
+                        "index": meta.get(
+                            "index"
+                        ),
+                        "image_path": meta.get(
+                            "image_path"
+                        ),
                         "question": meta["question"],
                         "gt_raw": gt_raw,
                         "gt_norm": gt_norm,
@@ -423,8 +604,230 @@ def evaluate_single_checkpoint(
                             if is_closed_question
                             else "open"
                         ),
+
+                        # =================================================
+                        # 三尺度路由诊断
+                        # =================================================
+                        "routing_f1": (
+                            float(
+                                batch_routing_weights[
+                                    index,
+                                    0,
+                                ].item()
+                            )
+                            if batch_routing_weights
+                               is not None
+                            else None
+                        ),
+                        "routing_f3": (
+                            float(
+                                batch_routing_weights[
+                                    index,
+                                    1,
+                                ].item()
+                            )
+                            if batch_routing_weights
+                               is not None
+                            else None
+                        ),
+                        "routing_f5": (
+                            float(
+                                batch_routing_weights[
+                                    index,
+                                    2,
+                                ].item()
+                            )
+                            if batch_routing_weights
+                               is not None
+                            else None
+                        ),
+
+                        # 图文对级 soft gate。
+                        "residual_gate": (
+                            float(
+                                batch_gates[
+                                    index
+                                ].item()
+                            )
+                            if batch_gates is not None
+                            else None
+                        ),
+
+                        # 全局共享 lambda；
+                        # 此处复制到每个样本记录中，方便后续导出与分析。
+                        "lambda_value": (
+                            float(
+                                batch_lambdas[
+                                    index
+                                ].item()
+                            )
+                            if batch_lambdas is not None
+                            else None
+                        ),
+
+                        # 当前图文对的实际残差系数 λg。
+                        "effective_residual_scale": (
+                            float(
+                                batch_effective_scales[
+                                    index
+                                ].item()
+                            )
+                            if batch_effective_scales
+                               is not None
+                            else None
+                        ),
                     }
                 )
+
+    # =========================================================
+    # 三尺度 routing / gate / lambda 总体统计
+    # =========================================================
+    if routing_weight_records:
+        all_routing_weights = torch.cat(
+            routing_weight_records,
+            dim=0,
+        )
+        all_gates = torch.cat(
+            gate_records,
+            dim=0,
+        )
+        all_lambdas = torch.cat(
+            lambda_records,
+            dim=0,
+        )
+        all_effective_scales = torch.cat(
+            effective_scale_records,
+            dim=0,
+        )
+
+        num_records = len(all_records)
+
+        if all_routing_weights.shape != (
+                num_records,
+                3,
+        ):
+            raise RuntimeError(
+                "路由记录数量或维度异常："
+                f"routing="
+                f"{tuple(all_routing_weights.shape)}，"
+                f"预期为 ({num_records}, 3)。"
+            )
+
+        if all_gates.shape != (
+                num_records,
+        ):
+            raise RuntimeError(
+                "gate 记录数量异常："
+                f"gate={tuple(all_gates.shape)}，"
+                f"预期为 ({num_records},)。"
+            )
+
+        if all_lambdas.shape != (
+                num_records,
+        ):
+            raise RuntimeError(
+                "lambda 记录数量异常："
+                f"lambda={tuple(all_lambdas.shape)}，"
+                f"预期为 ({num_records},)。"
+            )
+
+        # -----------------------------------------------------
+        # 三尺度平均权重
+        # -----------------------------------------------------
+        mean_scale_weights = (
+            all_routing_weights.mean(
+                dim=0
+            )
+        )
+
+        # -----------------------------------------------------
+        # 路由熵
+        # -----------------------------------------------------
+        safe_weights = (
+            all_routing_weights
+            .clamp_min(1e-12)
+        )
+
+        routing_entropy = -(
+                safe_weights
+                * safe_weights.log()
+        ).sum(dim=-1)
+
+        normalized_entropy = (
+                routing_entropy.mean().item()
+                / math.log(3)
+        )
+
+        # -----------------------------------------------------
+        # gate 与有效残差系数的分位数
+        # -----------------------------------------------------
+        quantile_levels = torch.tensor(
+            [0.1, 0.5, 0.9],
+            dtype=torch.float32,
+        )
+
+        gate_quantiles = torch.quantile(
+            all_gates,
+            quantile_levels,
+        )
+
+        effective_quantiles = torch.quantile(
+            all_effective_scales,
+            quantile_levels,
+        )
+
+        print("\n" + "=" * 70)
+        print(
+            "三尺度路由诊断 | "
+            f"checkpoint="
+            f"{os.path.basename(weights_path)}"
+        )
+        print("=" * 70)
+
+        print(
+            "平均专家权重："
+            f"F1={mean_scale_weights[0].item():.6f}, "
+            f"F3={mean_scale_weights[1].item():.6f}, "
+            f"F5={mean_scale_weights[2].item():.6f}"
+        )
+
+        print(
+            "residual gate："
+            f"mean={all_gates.mean().item():.6f}, "
+            f"std={all_gates.std(unbiased=False).item():.6f}, "
+            f"P10={gate_quantiles[0].item():.6f}, "
+            f"P50={gate_quantiles[1].item():.6f}, "
+            f"P90={gate_quantiles[2].item():.6f}"
+        )
+
+        print(
+            "lambda："
+            f"mean={all_lambdas.mean().item():.6f}, "
+            f"min={all_lambdas.min().item():.6f}, "
+            f"max={all_lambdas.max().item():.6f}"
+        )
+
+        print(
+            "lambda × gate："
+            f"mean="
+            f"{all_effective_scales.mean().item():.6f}, "
+            f"std="
+            f"{all_effective_scales.std(unbiased=False).item():.6f}, "
+            f"P10="
+            f"{effective_quantiles[0].item():.6f}, "
+            f"P50="
+            f"{effective_quantiles[1].item():.6f}, "
+            f"P90="
+            f"{effective_quantiles[2].item():.6f}"
+        )
+
+        print(
+            "路由 entropy："
+            f"mean={routing_entropy.mean().item():.6f}, "
+            f"归一化={normalized_entropy:.6f}"
+        )
+
+        print("=" * 70)
 
     # 本地生成完成后释放当前 checkpoint 模型显存。
     del model

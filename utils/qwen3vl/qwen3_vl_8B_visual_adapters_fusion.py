@@ -16,7 +16,7 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
     消融友好的 V2-lite fusion module。
 
     支持：
-    - 四专家 F1/F3/F5/F7
+    - 三专家 F1/F3/F5
     - learned / fixed scale routing
     - learned / fixed soft gate
     - learnable / fixed lambda
@@ -30,7 +30,6 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
         adapter_f1: nn.Module,
         adapter_f3: nn.Module,
         adapter_f5: nn.Module,
-        adapter_f7: nn.Module,
         biomedclip_image_encoder_dim: int = 512,
         biomedclip_text_encoder_dim: int = 512,
         router_hidden_dim: int = 128,
@@ -75,7 +74,6 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
         self.adapter_f1 = adapter_f1
         self.adapter_f3 = adapter_f3
         self.adapter_f5 = adapter_f5
-        self.adapter_f7 = adapter_f7
 
         if use_cross_modal_prior:
             if biomedclip_image_encoder_dim != biomedclip_text_encoder_dim:
@@ -93,10 +91,16 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
             nn.GELU(),
         )
 
-        self.scale_head = nn.Linear(router_hidden_dim, 4)
+        self.scale_head = nn.Linear(
+            router_hidden_dim,
+            3,
+        )
         self.gate_head = nn.Linear(router_hidden_dim, 1)
 
-        fixed_scale_weights = normalize_fixed_weights(fixed_scale_weights, num_experts=4)
+        fixed_scale_weights = normalize_fixed_weights(
+            fixed_scale_weights,
+            num_experts=3,
+        )
         self.register_buffer(
             "fixed_scale_weights",
             torch.tensor(fixed_scale_weights, dtype=torch.float32),
@@ -259,22 +263,31 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
             w1 = scale_weights[i, 0]
             w3 = scale_weights[i, 1]
             w5 = scale_weights[i, 2]
-            w7 = scale_weights[i, 3]
 
-            g = soft_gate[i].view(1, 1, 1)
+            g = soft_gate[i].view(
+                1,
+                1,
+                1,
+            )
 
-            norm_sub_x = self.norm(sub_x)
+            norm_sub_x = self.norm(
+                sub_x
+            )
 
-            res1 = self.adapter_f1(norm_sub_x)
-            res3 = self.adapter_f3(norm_sub_x)
-            res5 = self.adapter_f5(norm_sub_x)
-            res7 = self.adapter_f7(norm_sub_x)
+            res1 = self.adapter_f1(
+                norm_sub_x
+            )
+            res3 = self.adapter_f3(
+                norm_sub_x
+            )
+            res5 = self.adapter_f5(
+                norm_sub_x
+            )
 
             residual = (
-                w1 * res1
-                + w3 * res3
-                + w5 * res5
-                + w7 * res7
+                    w1 * res1
+                    + w3 * res3
+                    + w5 * res5
             )
 
             if self.use_rms_norm:

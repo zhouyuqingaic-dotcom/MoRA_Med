@@ -10,7 +10,6 @@ from utils.qwen3vl.qwen3_vl_8B_visual_adapter import (
     VisualAdapter_F1,
     VisualAdapter_F3,
     VisualAdapter_F5,
-    VisualAdapter_F7,
 )
 
 from utils.qwen3vl.qwen3_vl_8B_visual_adapters_fusion import (
@@ -259,7 +258,9 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         # 4. 定位 Qwen3-VL 视觉塔
         # ===============================================================
         print(
-            "\n✨ [RoMA-Net V2-lite] 正在挂载四尺度 soft-gated visual residual adapter..."
+            "\n✨ [RoMA-Net V2-lite-3S] "
+            "正在挂载三尺度 F1/F3/F5 "
+            "soft-gated visual residual adapter..."
         )
         print(
             f"    scale_mode={self.scale_mode}, "
@@ -278,7 +279,7 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         adapter_dtype = ref_param.dtype if ref_param.is_floating_point() else torch.bfloat16
 
         # ===============================================================
-        # 5. 实例化四个 residual experts: F1/F3/F5/F7
+        # 5. 实例化三个 residual experts: F1/F3/F5
         # ===============================================================
         adapter_f1 = VisualAdapter_F1(
             hidden_dim=hidden_dim,
@@ -292,10 +293,6 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
             hidden_dim=hidden_dim,
             r=r,
         )
-        adapter_f7 = VisualAdapter_F7(
-            hidden_dim=hidden_dim,
-            r=r,
-        )
 
         # ===============================================================
         # 6. 实例化统一的消融友好 fusion module
@@ -305,7 +302,6 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
             adapter_f1=adapter_f1,
             adapter_f3=adapter_f3,
             adapter_f5=adapter_f5,
-            adapter_f7=adapter_f7,
 
             router_hidden_dim=self.router_hidden_dim,
 
@@ -323,9 +319,13 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
 
             use_rms_norm=self.use_rms_norm,
             residual_norm_eps=self.residual_norm_eps,
-            residual_norm_ratio_clip=self.residual_norm_ratio_clip,
+            residual_norm_ratio_clip=(
+                self.residual_norm_ratio_clip
+            ),
 
-            use_cross_modal_prior=self.use_cross_modal_prior,
+            use_cross_modal_prior=(
+                self.use_cross_modal_prior
+            ),
         )
 
         # 挂到视觉塔上，使其被 PyTorch/PEFT 正确追踪
