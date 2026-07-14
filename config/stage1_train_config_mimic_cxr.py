@@ -88,8 +88,13 @@ class TrainConfig:
     # 缓存配置
     mimic_cxr_cache_dir: str = "/home/yuqing/Datas/mimic-cxr-jpg-2.1.0/cache"
     mimic_cxr_use_indices_cache: bool = True
+
+    # 四卡正式训练时保持 False。
     mimic_cxr_rebuild_indices_cache: bool = False
-    mimic_cxr_cache_prefix: str = "mimic_cxr"
+
+    # v2 表示使用 mimic_cxr_text_train_cleaning
+    # 过滤清洗后无效的监督文本。
+    mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2"
 
     # MIMIC-CXR 专属指令
     mimic_cxr_instruction_suffix: str = (

@@ -1,11 +1,15 @@
 import csv
 import gzip
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from torch.utils.data import Dataset
-import json
+
+from utils.data_tools.prompt_cleaning.mimic_cxr_text_cleaning import (
+    mimic_cxr_text_train_cleaning,
+)
 
 
 class MIMICCXRDataset(Dataset):
@@ -211,26 +215,60 @@ class MIMICCXRDataset(Dataset):
                 print(f"[MIMICCXRDataset] Samples after cache filtering: {len(self.samples)}")
                 return
 
-        # 没有缓存，或者强制重建，就慢扫一次
-        kept_rows = []
-        kept_indices = []
+        # 没有缓存，或者强制重建，就慢扫一次。
+        kept_rows: List[Dict[str, str]] = []
+        kept_indices: List[int] = []
+
+        raw_empty_count = 0
+        cleaned_empty_count = 0
 
         for i, row in enumerate(filtered):
             report_path = self._build_report_path(row)
             report_text = self._read_report(report_path)
             parsed = self._parse_report_sections(report_text)
 
-            if parsed["target_text"].strip():
-                kept_rows.append(row)
-                kept_indices.append(i)
+            raw_target_text = parsed["target_text"]
+
+            if not raw_target_text.strip():
+                raw_empty_count += 1
+                continue
+
+            cleaned_target_text = mimic_cxr_text_train_cleaning(
+                raw_target_text
+            )
+
+            if not cleaned_target_text:
+                cleaned_empty_count += 1
+                continue
+
+            kept_rows.append(row)
+            kept_indices.append(i)
 
         self.samples = kept_rows
 
-        if self.use_indices_cache and cache_path is not None:
-            self._save_cached_indices(cache_path, kept_indices)
-            print(f"[MIMICCXRDataset] Saved valid indices cache: {cache_path}")
+        print(
+            "[MIMICCXRDataset] Filter statistics: "
+            f"input={len(filtered)}, "
+            f"raw_empty={raw_empty_count}, "
+            f"cleaned_empty={cleaned_empty_count}, "
+            f"kept={len(kept_rows)}"
+        )
 
-        print(f"[MIMICCXRDataset] Samples after rebuilding filter: {len(self.samples)}")
+        if self.use_indices_cache and cache_path is not None:
+            self._save_cached_indices(
+                cache_path,
+                kept_indices,
+            )
+            print(
+                "[MIMICCXRDataset] "
+                f"Saved valid indices cache: {cache_path}"
+            )
+
+        print(
+            "[MIMICCXRDataset] "
+            f"Samples after rebuilding filter: {len(self.samples)}"
+        )
+
 
     # ------------------------------------------------------------------
     # 路径构建
