@@ -6,10 +6,11 @@ import torch.nn as nn
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import PreTrainedModel
 
+from utils.ddp.ddp_utils import ddp_print
 from utils.qwen3vl.qwen3_vl_8B_visual_adapter import (
-    VisualAdapter_F1,
     VisualAdapter_F3,
     VisualAdapter_F5,
+    VisualAdapter_F7,
 )
 
 from utils.qwen3vl.qwen3_vl_8B_visual_adapters_fusion import (
@@ -241,7 +242,7 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         if not self.enable_visual_adapter:
             self._patch_forward_to_drop_biomed_kwargs(peft_model)
 
-            print("\n✅ [A0 / LoRA Only] 未挂载 visual residual adapter。")
+            ddp_print("\n✅ [A0 / LoRA Only] 未挂载 visual residual adapter。")
             peft_model.print_trainable_parameters()
             return peft_model
 
@@ -257,13 +258,16 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         # ===============================================================
         # 4. 定位 Qwen3-VL 视觉塔
         # ===============================================================
-        print(
-            "\n✨ [RoMA-Net V2-lite-3S] "
-            "正在挂载三尺度 F1/F3/F5 "
+        ddp_print(
+            "\n✨ [RoMA-Net V2-lite-3S Conv2D] "
+            "正在挂载三尺度 DWConv2D F3/F5/F7 "
+            "(3x3 / 5x5 / 7x7) "
             "soft-gated visual residual adapter..."
         )
-        print(
-            f"    scale_mode={self.scale_mode}, "
+        ddp_print(
+            f"    expert_type=DWConv2D, "
+            f"expert_scales=3x3/5x5/7x7, "
+            f"scale_mode={self.scale_mode}, "
             f"gate_mode={self.gate_mode}, "
             f"lambda_mode={self.lambda_mode}, "
             f"use_rms_norm={self.use_rms_norm}"
@@ -279,17 +283,17 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         adapter_dtype = ref_param.dtype if ref_param.is_floating_point() else torch.bfloat16
 
         # ===============================================================
-        # 5. 实例化三个 residual experts: F1/F3/F5
+        # 5. 实例化三个 DWConv2D residual experts: F3/F5/F7
         # ===============================================================
-        adapter_f1 = VisualAdapter_F1(
-            hidden_dim=hidden_dim,
-            r=r,
-        )
         adapter_f3 = VisualAdapter_F3(
             hidden_dim=hidden_dim,
             r=r,
         )
         adapter_f5 = VisualAdapter_F5(
+            hidden_dim=hidden_dim,
+            r=r,
+        )
+        adapter_f7 = VisualAdapter_F7(
             hidden_dim=hidden_dim,
             r=r,
         )
@@ -299,9 +303,9 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         # ===============================================================
         fusion_layer = Qwen3VLMoEVisualAdapterFusion(
             hidden_dim=hidden_dim,
-            adapter_f1=adapter_f1,
             adapter_f3=adapter_f3,
             adapter_f5=adapter_f5,
+            adapter_f7=adapter_f7,
 
             router_hidden_dim=self.router_hidden_dim,
 
@@ -434,7 +438,10 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
             vision_tower,
         )
 
-        print("✅ [RoMA-Net V2-lite] visual residual adapter 挂载成功！")
+        ddp_print(
+            "✅ [RoMA-Net V2-lite Conv2D F3/F5/F7] "
+            "visual residual adapter 挂载成功！"
+        )
         peft_model.print_trainable_parameters()
 
         return peft_model
