@@ -65,7 +65,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A0" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -92,9 +92,11 @@ class TrainConfig:
     # 四卡正式训练时保持 False。
     mimic_cxr_rebuild_indices_cache: bool = False
 
-    # v2 表示使用 mimic_cxr_text_train_cleaning
-    # 过滤清洗后无效的监督文本。
-    mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2"
+    # # v2 表示使用 mimic_cxr_text_train_cleaning
+    # # 过滤清洗后无效的监督文本。
+    # mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2"
+    #换成生成80k子集(用于快速验证)
+    mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2_screen80k_seed2048"
 
     # MIMIC-CXR 专属指令
     mimic_cxr_instruction_suffix: str = (
@@ -393,16 +395,30 @@ class TrainConfig:
         # =====================================================
         # 4. 输出目录
         # =====================================================
+        if self.ablation_id == "A0":
+            # 纯 LoRA baseline，不包含视觉适配器、Router、Gate 和 Lambda。
+            experiment_name = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.mimic_cxr_cache_prefix}_"
+                f"A0_LoRAOnly_"
+                f"Seed-{self.seed}"
+            )
+        else:
+            experiment_name = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.mimic_cxr_cache_prefix}_"
+                f"{self.ablation_id}_"
+                f"Experts-F1-F3-F5_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}_"
+                f"Lambda-{self.lambda_mode}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.seed}"
+            )
+
         self.output_dir = (
             f"{self.output_root}/"
-            f"Stage1_MIMIC_CXR_"
-            f"{self.ablation_id}_"
-            f"Experts-F1-F3-F5_"
-            f"Scale-{self.scale_mode}_"
-            f"Gate-{self.gate_mode}_"
-            f"Lambda-{self.lambda_mode}_"
-            f"RMS-{int(self.use_rms_norm)}_"
-            f"Seed-{self.seed}"
+            f"{experiment_name}"
         )
 
         print(f"当前输出目录为: {self.output_dir}")

@@ -942,7 +942,8 @@ def main():
             "checkpoint-* 或 final_weights 目录。"
         )
         return
-
+    #零时测试，只跑最后一个checkpoints
+    checkpoint_dirs=checkpoint_dirs[-1:]
     print(
         f"🔍 发现 {len(checkpoint_dirs)} 个 SLAKE 评测节点 | "
         f"消融={cfg.ablation_id}"
