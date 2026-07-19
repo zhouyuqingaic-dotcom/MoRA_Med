@@ -65,7 +65,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A0" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -408,7 +408,7 @@ class TrainConfig:
                 f"Stage1_MIMIC_CXR_"
                 f"{self.mimic_cxr_cache_prefix}_"
                 f"{self.ablation_id}_"
-                f"Experts-F1-F3-F5_"
+                f"Experts-Conv2D-F3_F5_F7"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}_"
                 f"Lambda-{self.lambda_mode}_"
