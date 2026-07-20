@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass, field
 from typing import Optional
-
+from utils.ddp.ddp_utils import ddp_print
 
 @dataclass
 class Stage2TrainConfig:
@@ -26,8 +26,14 @@ class Stage2TrainConfig:
     # Stage 1 训练时使用的随机种子，用于推导权重目录
     stage1_seed: int = 2048
 
+    # Stage 1 使用的 MIMIC-CXR 数据缓存前缀。
+    # 必须与 Stage 1 TrainConfig 中的 mimic_cxr_cache_prefix 完全一致。
+    stage1_mimic_cxr_cache_prefix: str = (
+        "mimic_cxr_train_clean_v2_screen80k_seed2048"
+    )
+
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A5"
+    ablation_id: str = "A6" #"A0" #"A5"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -106,8 +112,14 @@ class Stage2TrainConfig:
     # =========================================================
     # 6. SLAKE 训练超参数
     # =========================================================
-    per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 2
+    #重要，一定要根据卡数量调整，这回改变参数更新次数
+    ## 双卡：
+    # per_device_train_batch_size = 4
+    # gradient_accumulation_steps = 2
+    #四卡：
+    per_device_train_batch_size = 4
+    gradient_accumulation_steps = 1
+
     num_train_epochs: float = 3.0
 
     learning_rate: float = 1e-5
@@ -159,7 +171,7 @@ class Stage2TrainConfig:
         if len(self.fixed_scale_weights) != 3:
             raise ValueError(
                 "fixed_scale_weights 必须包含 3 个值，"
-                "对应 F1/F3/F5。"
+                "依次对应 Conv2D F3/F5/F7。"
             )
 
         aid = self.ablation_id.upper()
@@ -222,26 +234,76 @@ class Stage2TrainConfig:
             self.lambda_max = 1.0
             self.use_rms_norm = True
 
+        elif aid == "A6":
+            # -------------------------------------------------
+            # 强视觉残差注入实验。
+            #
+            # effective residual scale = fixed_lambda * gate
+            # Stage 1 初始约为：
+            # 1.0 * 0.5 = 0.5
+            #
+            # Stage 2 会继承 Stage 1 已训练的 Gate 参数，
+            # gate_init 主要用于保持结构与配置语义一致。
+            # -------------------------------------------------
+            self.enable_visual_adapter = True
+
+            # BioMedCLIP-conditioned F3/F5/F7 动态路由
+            self.scale_mode = "learned"
+
+            # 样本级 residual gate
+            self.gate_mode = "learned"
+            self.gate_init = 0.5
+
+            # 固定 lambda=1.0
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 1.0
+
+            # 保留 residual RMS normalization
+            self.use_rms_norm = True
+
         else:
             raise ValueError(
                 f"不支持的 ablation_id：{aid}。"
-                "可选值为 A0、A1、A2、A3、A4、A5。"
+                "可选值为 A0、A1、A2、A3、A4、A5、A6。"
             )
 
         # -----------------------------------------------------
         # Stage 1 权重目录
-        # 命名规则与 Stage 1 TrainConfig 完全一致
+        # 必须与 Stage 1 TrainConfig 的命名规则完全一致。
         # -----------------------------------------------------
-        stage1_experiment_dir = (
-            f"Stage1_MIMIC_CXR_"
-            f"{self.ablation_id}_"
-            f"Experts-F1-F3-F5_"
-            f"Scale-{self.scale_mode}_"
-            f"Gate-{self.gate_mode}_"
-            f"Lambda-{self.lambda_mode}_"
-            f"RMS-{int(self.use_rms_norm)}_"
-            f"Seed-{self.stage1_seed}"
-        )
+        if self.ablation_id == "A0":
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"A0_LoRAOnly_"
+                f"Seed-{self.stage1_seed}"
+            )
+
+        elif self.ablation_id == "A6":
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"A6_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
+                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.stage1_seed}"
+            )
+
+        else:
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{self.ablation_id}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}_"
+                f"Lambda-{self.lambda_mode}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.stage1_seed}"
+            )
 
         self.stage1_weights_dir = os.path.join(
             self.output_root,
@@ -251,23 +313,79 @@ class Stage2TrainConfig:
 
         # -----------------------------------------------------
         # Stage 2 输出目录
+        # 将 Stage 1 数据来源和 Conv2D 结构都写进目录名，
         # -----------------------------------------------------
-        stage2_experiment_dir = (
-            f"Stage2_SLAKE_"
-            f"{self.ablation_id}_"
-            f"Experts-F1-F3-F5_"
-            f"Scale-{self.scale_mode}_"
-            f"Gate-{self.gate_mode}_"
-            f"Lambda-{self.lambda_mode}_"
-            f"RMS-{int(self.use_rms_norm)}_"
-            f"From-Stage1-Seed-{self.stage1_seed}_"
-            f"Seed-{self.seed}"
-        )
+        if self.ablation_id == "A0":
+            stage2_experiment_dir = (
+                f"Stage2_SLAKE_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"A0_LoRAOnly_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
+        elif self.ablation_id == "A6":
+            stage2_experiment_dir = (
+                f"Stage2_SLAKE_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"A6_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
+                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
+        else:
+            stage2_experiment_dir = (
+                f"Stage2_SLAKE_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{self.ablation_id}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}_"
+                f"Lambda-{self.lambda_mode}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
 
         self.output_dir = os.path.join(
             self.output_root,
             stage2_experiment_dir,
         )
 
-        print(f"Stage 1 权重目录：{self.stage1_weights_dir}")
-        print(f"Stage 2 输出目录：{self.output_dir}")
+        if self.enable_visual_adapter:
+            if self.lambda_mode == "fixed":
+                configured_lambda = self.fixed_lambda
+            else:
+                configured_lambda = self.lambda_init
+
+            configured_gate = (
+                self.gate_init
+                if self.gate_mode == "learned"
+                else self.fixed_gate
+            )
+
+            ddp_print(
+                "视觉残差配置："
+                f"lambda_mode={self.lambda_mode}, "
+                f"lambda={configured_lambda}, "
+                f"gate_mode={self.gate_mode}, "
+                f"gate_init={configured_gate}, "
+                f"初始lambda×gate={configured_lambda * configured_gate}"
+            )
+
+        ddp_print(f"Stage 1 权重目录：{self.stage1_weights_dir}")
+        ddp_print(f"Stage 2 输出目录：{self.output_dir}")
+        if self.enable_visual_adapter:
+            ddp_print(
+                "视觉专家结构：DWConv2D "
+                "F3=3x3, F5=5x5, F7=7x7"
+            )
+        else:
+            ddp_print(
+                "视觉专家结构：A0 LoRA-only，未启用 visual adapter"
+            )

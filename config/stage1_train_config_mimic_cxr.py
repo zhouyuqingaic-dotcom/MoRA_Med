@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Optional
-
+from utils.ddp.ddp_utils import ddp_print
 
 @dataclass
 class TrainConfig:
@@ -40,6 +40,13 @@ class TrainConfig:
         fixed_lambda=0.1
         use_rms_norm=True
 
+    A4 optional:
+        Full w/o RMS
+        scale_mode="learned"
+        gate_mode="learned"
+        lambda_mode="learnable"
+        use_rms_norm=False
+
     A5:
         Full RoMA-Net V2-lite
         scale_mode="learned"
@@ -49,12 +56,14 @@ class TrainConfig:
         lambda_max=1.0
         use_rms_norm=True
 
-    A4 optional:
-        Full w/o RMS
+    A6:
+        Strong visual residual injection
         scale_mode="learned"
         gate_mode="learned"
-        lambda_mode="learnable"
-        use_rms_norm=False
+        gate_init=0.5
+        lambda_mode="fixed"
+        fixed_lambda=1.0
+        use_rms_norm=True
     """
 
     # =========================================================
@@ -65,7 +74,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -176,7 +185,7 @@ class TrainConfig:
     # 7. RoMA-Net V2-lite Visual Adapter 配置
     # =========================================================
 
-    # A0 时为 False，其余 A1/A2/A3/A4/A5 为 True
+    # A0 时为 False，其余 A1/A2/A3/A4/A5/A6 为 True
     enable_visual_adapter: bool = True
 
     # Qwen3-VL-8B 视觉 token hidden dim
@@ -191,7 +200,7 @@ class TrainConfig:
     # -----------------------------
     # Scale routing
     # -----------------------------
-    # learned: BioMedCLIP-aware router 学习 π1/π3/π5
+    # learned: BioMedCLIP-aware router 学习 π3/π5/π7
     # fixed: 使用 fixed_scale_weights
     scale_mode: str = "learned"
 
@@ -351,10 +360,36 @@ class TrainConfig:
 
             self.use_rms_norm = True
 
+        elif aid == "A6":
+            # -------------------------------------------------
+            # 强视觉残差注入实验。
+            #
+            # effective residual scale = fixed_lambda * gate
+            # 初始状态约为：
+            # 1.0 * 0.5 = 0.5
+            #
+            # lambda 固定，仅由样本级 Gate 控制残差强度。
+            # -------------------------------------------------
+            self.enable_visual_adapter = True
+
+            # BioMedCLIP-conditioned F3/F5/F7 动态路由
+            self.scale_mode = "learned"
+
+            # 样本级 residual gate
+            self.gate_mode = "learned"
+            self.gate_init = 0.5
+
+            # 强制固定 lambda=1.0
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 1.0
+
+            # 保持 residual RMS normalization
+            self.use_rms_norm = True
+
         else:
             raise ValueError(
                 f"不支持的 ablation_id: {self.ablation_id}。"
-                "可选值为 A0、A1、A2、A3、A4、A5。"
+                "可选值为 A0、A1、A2、A3、A4、A5、A6。"
             )
 
 
@@ -373,7 +408,7 @@ class TrainConfig:
         if len(self.fixed_scale_weights) != 3:
             raise ValueError(
                 "fixed_scale_weights 必须包含 3 个值，"
-                "对应 F1/F3/F5。"
+                "依次对应 Conv2D F3/F5/F7。"
             )
 
         if self.lambda_max <= 0:
@@ -403,12 +438,26 @@ class TrainConfig:
                 f"A0_LoRAOnly_"
                 f"Seed-{self.seed}"
             )
+
+        elif self.ablation_id == "A6":
+            experiment_name = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.mimic_cxr_cache_prefix}_"
+                f"A6_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
+                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.seed}"
+            )
+
         else:
             experiment_name = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.mimic_cxr_cache_prefix}_"
                 f"{self.ablation_id}_"
-                f"Experts-Conv2D-F3_F5_F7"
+                f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}_"
                 f"Lambda-{self.lambda_mode}_"
@@ -421,4 +470,23 @@ class TrainConfig:
             f"{experiment_name}"
         )
 
-        print(f"当前输出目录为: {self.output_dir}")
+        if self.enable_visual_adapter:
+            if self.lambda_mode == "fixed":
+                initial_lambda = self.fixed_lambda
+            else:
+                initial_lambda = self.lambda_init
+
+            initial_effective_scale = initial_lambda * (
+                self.gate_init
+                if self.gate_mode == "learned"
+                else self.fixed_gate
+            )
+
+            ddp_print(
+                "视觉残差初始配置："
+                f"lambda={initial_lambda}, "
+                f"gate={self.gate_init if self.gate_mode == 'learned' else self.fixed_gate}, "
+                f"lambda×gate={initial_effective_scale}"
+            )
+
+        ddp_print(f"当前输出目录为: {self.output_dir}")

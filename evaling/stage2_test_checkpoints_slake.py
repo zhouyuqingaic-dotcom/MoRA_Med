@@ -40,7 +40,7 @@ from LLM_api.prompts.slake_prompt_builder_gpt_5_mini import (
 
 
 def get_visual_adapter(model):
-    """获取当前模型中的 RoMA-Net V2-lite visual adapter。"""
+    """获取当前模型中的 MoRA_Med V2-lite visual adapter。"""
     if hasattr(model, "module"):
         model = model.module
 
@@ -104,7 +104,10 @@ def build_model_for_checkpoint(
         # Router backbone。
         router_hidden_dim=cfg.router_hidden_dim,
 
-        # 三尺度 F1/F3/F5 routing
+        # 三尺度 Conv2D F3/F5/F7 routing
+        # index 0 -> F3
+        # index 1 -> F5
+        # index 2 -> F7
         scale_mode=cfg.scale_mode,
         fixed_scale_weights=cfg.fixed_scale_weights,
 
@@ -224,7 +227,7 @@ def evaluate_single_checkpoint(
 
     model, base_model = built_model
 
-    # 获取三尺度 RoMA-Net visual adapter，
+    # 获取三尺度 MoRA_Med visual adapter，
     # 用于读取推理过程中产生的路由权重。
     adapter_module = None
 
@@ -311,7 +314,7 @@ def evaluate_single_checkpoint(
     # 三尺度路由诊断记录
     # ---------------------------------------------------------
     # routing_weight_records:
-    #   每个图文对的 F1/F3/F5 权重。
+    #   每个图文对的 Conv2D F3/F5/F7 权重。
     #
     # gate_records:
     #   每个图文对的 soft residual gate。
@@ -437,7 +440,7 @@ def evaluate_single_checkpoint(
                 batch_size = len(metadata_list)
 
                 # -----------------------------------------------------
-                # 路由权重：[B, 3]，分别对应 F1/F3/F5
+                # 路由权重：[B, 3]，依次对应 F3/F5/F7
                 # -----------------------------------------------------
                 batch_routing_weights = (
                     routing_weights
@@ -608,39 +611,39 @@ def evaluate_single_checkpoint(
                         # =================================================
                         # 三尺度路由诊断
                         # =================================================
-                        "routing_f1": (
+                        "routing_f3": (
                             float(
                                 batch_routing_weights[
                                     index,
                                     0,
                                 ].item()
                             )
-                            if batch_routing_weights
-                               is not None
+                            if batch_routing_weights is not None
                             else None
                         ),
-                        "routing_f3": (
+
+                        "routing_f5": (
                             float(
                                 batch_routing_weights[
                                     index,
                                     1,
                                 ].item()
                             )
-                            if batch_routing_weights
-                               is not None
+                            if batch_routing_weights is not None
                             else None
                         ),
-                        "routing_f5": (
+
+                        "routing_f7": (
                             float(
                                 batch_routing_weights[
                                     index,
                                     2,
                                 ].item()
                             )
-                            if batch_routing_weights
-                               is not None
+                            if batch_routing_weights is not None
                             else None
                         ),
+
 
                         # 图文对级 soft gate。
                         "residual_gate": (
@@ -786,9 +789,9 @@ def evaluate_single_checkpoint(
 
         print(
             "平均专家权重："
-            f"F1={mean_scale_weights[0].item():.6f}, "
-            f"F3={mean_scale_weights[1].item():.6f}, "
-            f"F5={mean_scale_weights[2].item():.6f}"
+            f"F3={mean_scale_weights[0].item():.6f}, "
+            f"F5={mean_scale_weights[1].item():.6f}, "
+            f"F7={mean_scale_weights[2].item():.6f}"
         )
 
         print(

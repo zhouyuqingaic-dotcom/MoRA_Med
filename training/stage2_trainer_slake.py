@@ -349,7 +349,10 @@ def main():
         # Router backbone
         router_hidden_dim=cfg.router_hidden_dim,
 
-        # 四尺度路由
+        # 三尺度 Conv2D 路由：
+        # index 0 -> F3 / 3x3
+        # index 1 -> F5 / 5x5
+        # index 2 -> F7 / 7x7
         scale_mode=cfg.scale_mode,
         fixed_scale_weights=cfg.fixed_scale_weights,
 
@@ -368,6 +371,11 @@ def main():
         use_rms_norm=cfg.use_rms_norm,
         residual_norm_eps=cfg.residual_norm_eps,
         residual_norm_ratio_clip=cfg.residual_norm_ratio_clip,
+    )
+
+    ddp_print(
+        "    visual_experts=DWConv2D F3/F5/F7 "
+        "(3x3 / 5x5 / 7x7)",
     )
 
     peft_model = wrapper.wrap(base_model)

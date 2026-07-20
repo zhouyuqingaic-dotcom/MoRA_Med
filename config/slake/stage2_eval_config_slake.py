@@ -17,7 +17,7 @@ class Stage2EvalConfig(Stage2TrainConfig):
     """
 
     # 必须对应要评测的 Stage 2 实验
-    ablation_id: str = "A5"
+    ablation_id: str = "A6" #"A0" #"A5"
 
     # Stage 2 训练种子
     seed: int = 2048
