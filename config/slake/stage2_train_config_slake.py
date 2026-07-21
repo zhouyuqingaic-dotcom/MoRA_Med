@@ -28,9 +28,13 @@ class Stage2TrainConfig:
 
     # Stage 1 使用的 MIMIC-CXR 数据缓存前缀。
     # 必须与 Stage 1 TrainConfig 中的 mimic_cxr_cache_prefix 完全一致。
+    # stage1_mimic_cxr_cache_prefix: str = (
+    #     "mimic_cxr_train_clean_v2"
+    # )
     stage1_mimic_cxr_cache_prefix: str = (
         "mimic_cxr_train_clean_v2_screen80k_seed2048"
     )
+
 
     # 必须与要加载的 Stage 1 消融保持一致
     ablation_id: str = "A6" #"A0" #"A5"
