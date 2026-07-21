@@ -168,8 +168,29 @@ class TrainConfig:
     gradient_accumulation_steps: int = 2
     num_train_epochs: float = 1.0
 
+    # =========================================================
+    # A6-DLR 分组学习率
+    # =========================================================
+
+    # False 表示使用旧 A6 的统一学习率。
+    # True 表示使用新的 A6-DLR。
+    use_discriminative_lr: bool = True
+
+    # 用于输出目录命名。
+    lr_recipe_name: str = "DLR"
+
+    # 旧统一学习率。
+    # 同时作为 TrainingArguments 的基础/显示学习率。
     learning_rate: float = 2e-5
+
+    # Stage 1 parameter-group learning rates
+    lora_learning_rate: float = 2e-5
+    visual_expert_learning_rate: float = 1e-4
+    router_gate_learning_rate: float = 5e-5
+    visual_norm_learning_rate: float = 2e-5
+
     weight_decay: float = 0.01
+
     lr_scheduler_type: str = "cosine"
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
@@ -440,10 +461,16 @@ class TrainConfig:
             )
 
         elif self.ablation_id == "A6":
+            a6_label = (
+                f"A6-{self.lr_recipe_name}"
+                if self.use_discriminative_lr
+                else "A6"
+            )
+
             experiment_name = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.mimic_cxr_cache_prefix}_"
-                f"A6_"
+                f"{a6_label}_"
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
@@ -487,6 +514,15 @@ class TrainConfig:
                 f"lambda={initial_lambda}, "
                 f"gate={self.gate_init if self.gate_mode == 'learned' else self.fixed_gate}, "
                 f"lambda×gate={initial_effective_scale}"
+            )
+
+        if self.use_discriminative_lr:
+            ddp_print(
+                "Stage 1 分组学习率："
+                f"LoRA={self.lora_learning_rate:g}, "
+                f"Experts={self.visual_expert_learning_rate:g}, "
+                f"Router/Gate={self.router_gate_learning_rate:g}, "
+                f"Norm={self.visual_norm_learning_rate:g}"
             )
 
         ddp_print(f"当前输出目录为: {self.output_dir}")

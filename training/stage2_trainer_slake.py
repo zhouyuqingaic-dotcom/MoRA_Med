@@ -19,6 +19,10 @@ from utils.qwen3vl.qwen3_vl_8B_quant_loader import Qwen3VLQuantizedLoader
 from utils.qwen3vl.qwen3_vl_8B_lora_wrapper import Qwen3VLLoraAndVisualAdapterWrapper
 from utils.biomedclip.biomed_clip_loader import load_biomedclip
 from utils.ddp.ddp_utils import ddp_print
+from utils.training.discriminative_optimizer import (
+    build_discriminative_adamw,
+    format_optimizer_groups,
+)
 
 # 引入 PEFT 的状态字典注入工具
 from peft import set_peft_model_state_dict
@@ -497,7 +501,14 @@ def main():
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_train_epochs=cfg.num_train_epochs,
-        learning_rate=cfg.learning_rate,
+
+        learning_rate=(
+            cfg.lora_learning_rate
+            if cfg.use_discriminative_lr
+            else cfg.learning_rate
+        ),
+        optim="adamw_torch",
+
         weight_decay=cfg.weight_decay,
         lr_scheduler_type=cfg.lr_scheduler_type,
         warmup_steps=cfg.warmup_steps,
@@ -514,6 +525,39 @@ def main():
         report_to="none",
     )
 
+    trainer_kwargs = {}
+
+    if cfg.use_discriminative_lr:
+        optimizer = build_discriminative_adamw(
+            peft_model,
+            lora_learning_rate=(
+                cfg.lora_learning_rate
+            ),
+            visual_expert_learning_rate=(
+                cfg.visual_expert_learning_rate
+            ),
+            router_gate_learning_rate=(
+                cfg.router_gate_learning_rate
+            ),
+            visual_norm_learning_rate=(
+                cfg.visual_norm_learning_rate
+            ),
+            weight_decay=cfg.weight_decay,
+            adam_beta1=training_args.adam_beta1,
+            adam_beta2=training_args.adam_beta2,
+            adam_epsilon=training_args.adam_epsilon,
+        )
+
+        trainer_kwargs["optimizers"] = (
+            optimizer,
+            None,
+        )
+
+        ddp_print(
+            format_optimizer_groups(optimizer),
+            print_rank=cfg.print_rank,
+        )
+
     trainer = Trainer(
         model=peft_model,
         args=training_args,
@@ -521,9 +565,12 @@ def main():
         data_collator=collator,
         callbacks=[
             VisualAdapterSaveCallback(
-                enable_visual_adapter=cfg.enable_visual_adapter
+                enable_visual_adapter=(
+                    cfg.enable_visual_adapter
+                )
             )
         ],
+        **trainer_kwargs,
     )
 
     trainer.train()

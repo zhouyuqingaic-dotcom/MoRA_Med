@@ -126,8 +126,28 @@ class Stage2TrainConfig:
 
     num_train_epochs: float = 3.0
 
+    # =========================================================
+    # A6-DLR 分组学习率
+    # =========================================================
+
+    use_discriminative_lr: bool = True
+    lr_recipe_name: str = "DLR"
+
+    # Stage 2 加载的 Stage 1 是否为 DLR 版本。
+    stage1_use_discriminative_lr: bool = True
+    stage1_lr_recipe_name: str = "DLR"
+
+    # 旧统一学习率，同时作为 Trainer 基础/显示学习率。
     learning_rate: float = 1e-5
+
+    # Stage 2 parameter-group learning rates
+    lora_learning_rate: float = 1e-5
+    visual_expert_learning_rate: float = 3e-5
+    router_gate_learning_rate: float = 2e-5
+    visual_norm_learning_rate: float = 1e-5
+
     weight_decay: float = 0.01
+
     lr_scheduler_type: str = "cosine"
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
@@ -284,10 +304,16 @@ class Stage2TrainConfig:
             )
 
         elif self.ablation_id == "A6":
+            stage1_a6_label = (
+                f"A6-{self.stage1_lr_recipe_name}"
+                if self.stage1_use_discriminative_lr
+                else "A6"
+            )
+
             stage1_experiment_dir = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A6_"
+                f"{stage1_a6_label}_"
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
@@ -329,10 +355,16 @@ class Stage2TrainConfig:
             )
 
         elif self.ablation_id == "A6":
+            stage2_a6_label = (
+                f"A6-{self.lr_recipe_name}"
+                if self.use_discriminative_lr
+                else "A6"
+            )
+
             stage2_experiment_dir = (
                 f"Stage2_SLAKE_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A6_"
+                f"{stage2_a6_label}_"
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
@@ -380,6 +412,15 @@ class Stage2TrainConfig:
                 f"gate_mode={self.gate_mode}, "
                 f"gate_init={configured_gate}, "
                 f"初始lambda×gate={configured_lambda * configured_gate}"
+            )
+
+        if self.use_discriminative_lr:
+            ddp_print(
+                "Stage 2 分组学习率："
+                f"LoRA={self.lora_learning_rate:g}, "
+                f"Experts={self.visual_expert_learning_rate:g}, "
+                f"Router/Gate={self.router_gate_learning_rate:g}, "
+                f"Norm={self.visual_norm_learning_rate:g}"
             )
 
         ddp_print(f"Stage 1 权重目录：{self.stage1_weights_dir}")

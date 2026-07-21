@@ -23,7 +23,11 @@ from utils.biomedclip.biomed_clip_loader import load_biomedclip
 
 # 4. 导入 DDP 打印工具
 from utils.ddp.ddp_utils import ddp_print
-
+# 导入学习率相关工具
+from utils.training.discriminative_optimizer import (
+    build_discriminative_adamw,
+    format_optimizer_groups,
+)
 
 def set_seed(seed: int):
     """
@@ -245,8 +249,14 @@ def main():
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_train_epochs=cfg.num_train_epochs,
 
-        learning_rate=cfg.learning_rate,
+        learning_rate=(
+            cfg.lora_learning_rate
+            if cfg.use_discriminative_lr
+            else cfg.learning_rate
+        ),
         weight_decay=cfg.weight_decay,
+        optim="adamw_torch",
+
         lr_scheduler_type=cfg.lr_scheduler_type,
         warmup_steps=cfg.warmup_steps,
         max_grad_norm=cfg.max_grad_norm,
@@ -279,11 +289,45 @@ def main():
         report_to="none",
     )
 
+    trainer_kwargs = {}
+
+    if cfg.use_discriminative_lr:
+        optimizer = build_discriminative_adamw(
+            model,
+            lora_learning_rate=(
+                cfg.lora_learning_rate
+            ),
+            visual_expert_learning_rate=(
+                cfg.visual_expert_learning_rate
+            ),
+            router_gate_learning_rate=(
+                cfg.router_gate_learning_rate
+            ),
+            visual_norm_learning_rate=(
+                cfg.visual_norm_learning_rate
+            ),
+            weight_decay=cfg.weight_decay,
+            adam_beta1=training_args.adam_beta1,
+            adam_beta2=training_args.adam_beta2,
+            adam_epsilon=training_args.adam_epsilon,
+        )
+
+        trainer_kwargs["optimizers"] = (
+            optimizer,
+            None,
+        )
+
+        ddp_print(
+            format_optimizer_groups(optimizer),
+            print_rank=cfg.print_rank,
+        )
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collator,
+        **trainer_kwargs,
     )
 
     # ==========================================
