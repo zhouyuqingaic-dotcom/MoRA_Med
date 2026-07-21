@@ -25,6 +25,10 @@ class Stage2EvalConfig(Stage2TrainConfig):
     # Stage 1 来源权重的种子
     stage1_seed: int = 2048
 
+    # True: 只评测 final_weights
+    # False: 评测 checkpoint-* 和 final_weights
+    eval_final_weights_only: bool = True
+
     # 评测结果根目录
     eval_output_root: str = (
         "/home/yuqing/Models/MoRA_Med/Eval_SLAKE"
@@ -40,42 +44,22 @@ class Stage2EvalConfig(Stage2TrainConfig):
     dataloader_num_workers: int = 4
 
     def __post_init__(self):
-        # 先由训练配置生成完全一致的 A0～A5 结构和 Stage 2 路径。
         super().__post_init__()
 
-        # super().__post_init__ 生成的 output_dir 就是 Stage 2 训练目录。
         self.stage2_run_dir = self.output_dir
-
-        self.stage2_weights_dir = os.path.join(
-            self.stage2_run_dir,
-            "final_weights",
-        )
-
-        run_name = os.path.basename(
-            self.stage2_run_dir
-        )
-
-        # 然后把 output_dir 改为评测结果目录。
-        self.output_dir = os.path.join(
-            self.eval_output_root,
-            run_name,
-        )
+        run_name = os.path.basename(self.stage2_run_dir)
+        self.output_dir = os.path.join(self.eval_output_root, run_name)
 
         print("\n" + "=" * 60)
+        print(f"SLAKE Stage 2 评测 | 消融={self.ablation_id}")
+        print(f"训练目录：{self.stage2_run_dir}")
+        print(f"输出目录：{self.output_dir}")
         print(
-            f"SLAKE Stage 2 评测配置 | "
-            f"消融={self.ablation_id}"
-        )
-        print(
-            f"Stage 2 训练目录："
-            f"{self.stage2_run_dir}"
-        )
-        print(
-            f"Stage 2 最终权重："
-            f"{self.stage2_weights_dir}"
-        )
-        print(
-            f"评测结果目录："
-            f"{self.output_dir}"
+            "评测节点："
+            + (
+                "final_weights"
+                if self.eval_final_weights_only
+                else "checkpoint-* + final_weights"
+            )
         )
         print("=" * 60 + "\n")

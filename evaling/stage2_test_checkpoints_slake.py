@@ -1,4 +1,6 @@
+import csv
 import glob
+import json
 import math
 import os
 import types
@@ -9,120 +11,90 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# 1. SLAKE 评测配置与数据集
+from config.LLM_config import LLMAPIConfig
 from config.slake.stage2_eval_config_slake import Stage2EvalConfig
 from datas.slake_datasets import SLAKEDataset
-
-# 2. Qwen3-VL 量化加载器与新版训练 Wrapper
-from utils.qwen3vl.qwen3_vl_8B_quant_loader import Qwen3VLQuantizedLoader
-from utils.qwen3vl.qwen3_vl_8B_lora_wrapper import (
-    Qwen3VLLoraAndVisualAdapterWrapper,
+from LLM_api.gpt_5_mini import GPT5MiniClient
+from LLM_api.prompts.slake_prompt_builder_gpt_5_mini import (
+    build_llm_judge_user_prompt,
+    parse_llm_judge_response,
 )
-
-# 3. SLAKE Eval Collator 与答案清洗器
+from utils.biomedclip.biomed_clip_loader import load_biomedclip
 from utils.data_tools.collator.slake.slake_datasets_eval_collator import (
     SLAKEEvalCollator,
 )
 from utils.data_tools.prompt_cleaning.slake_answer_cleaning import (
     slake_answer_eval_cleaning,
 )
-
-# 4. BioMedCLIP
-from utils.biomedclip.biomed_clip_loader import load_biomedclip
-
-# 5. LLM Judge
-from config.LLM_config import LLMAPIConfig
-from LLM_api.gpt_5_mini import GPT5MiniClient
-from LLM_api.prompts.slake_prompt_builder_gpt_5_mini import (
-    build_llm_judge_user_prompt,
-    parse_llm_judge_response,
+from utils.qwen3vl.qwen3_vl_8B_lora_wrapper import (
+    Qwen3VLLoraAndVisualAdapterWrapper,
 )
+from utils.qwen3vl.qwen3_vl_8B_quant_loader import Qwen3VLQuantizedLoader
 
 
-def get_visual_adapter(model):
-    """获取当前模型中的 MoRA_Med V2-lite visual adapter。"""
-    if hasattr(model, "module"):
-        model = model.module
-
-    try:
-        return (
-            model.base_model
-            .model
-            .model
-            .visual
-            .res_adapter
-        )
-    except AttributeError:
-        return None
-
-
-def build_model_for_checkpoint(
-    weights_path,
-    loader,
-    cfg,
-    biomed_extractor,
-):
+def get_adapter(model):
     """
-    使用与 Stage 2 训练完全一致的 Wrapper 重建模型，
-    然后加载当前 checkpoint 的 LoRA 与 visual adapter。
+    获取挂载在 Qwen3-VL 视觉塔中的 Visual Adapter。
 
-    这里不再手工创建旧版三专家结构，也不再手工 patch 视觉塔；
-    模型结构与视觉塔 patch 全部由新版 Wrapper 负责。
+    当前模型层级为：
+    PEFT model
+      -> base_model
+      -> model
+      -> model
+      -> visual
+      -> res_adapter
     """
-    lora_path = os.path.join(
-        weights_path,
-        "adapter_model.safetensors",
-    )
+    return model.base_model.model.model.visual.res_adapter
 
-    if not os.path.isfile(lora_path):
-        print(
-            f"⚠️ 跳过 {weights_path}："
-            f"缺少 LoRA 权重 {lora_path}"
-        )
-        return None
 
-    # 每个 checkpoint 都从同一个干净的 4-bit 底座重新构建。
+def build_model(weights_path, loader, cfg, biomed_extractor):
+    """
+    为指定 checkpoint 重建完整模型，并加载：
+
+    1. Qwen3-VL 4-bit 底座；
+    2. 当前 Stage 2 checkpoint 的 LoRA；
+    3. 当前 Stage 2 checkpoint 的 Visual Adapter。
+
+    每个 checkpoint 都从干净底座重新构建，避免不同 checkpoint
+    之间残留参数或状态。
+    """
     base_model = loader.load_model()
 
+    # 使用与训练阶段完全一致的 Wrapper 重建模型结构。
     wrapper = Qwen3VLLoraAndVisualAdapterWrapper(
-        # LoRA：必须与 Stage 2 训练配置一致。
+        # LoRA 配置。
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
         lora_dropout=cfg.lora_dropout,
         lora_target_modules=cfg.lora_target_modules,
         gradient_checkpointing=False,
 
-        # Visual adapter。
+        # Visual Adapter 配置。
         visual_adapter_hidden_dim=cfg.visual_adapter_hidden_dim,
         visual_adapter_r=cfg.visual_adapter_r,
         enable_visual_adapter=cfg.enable_visual_adapter,
 
-        # BioMedCLIP route feature。
+        # BioMedCLIP 路由条件。
         biomed_extractor=biomed_extractor,
         use_cross_modal_prior=cfg.use_cross_modal_prior,
 
-        # Router backbone。
+        # Router 配置。
         router_hidden_dim=cfg.router_hidden_dim,
-
-        # 三尺度 Conv2D F3/F5/F7 routing
-        # index 0 -> F3
-        # index 1 -> F5
-        # index 2 -> F7
         scale_mode=cfg.scale_mode,
         fixed_scale_weights=cfg.fixed_scale_weights,
 
-        # Soft gate。
+        # 样本级 residual gate。
         gate_mode=cfg.gate_mode,
         fixed_gate=cfg.fixed_gate,
         gate_init=cfg.gate_init,
 
-        # 有界 lambda。
+        # 全局残差系数 lambda。
         lambda_mode=cfg.lambda_mode,
         fixed_lambda=cfg.fixed_lambda,
         lambda_max=cfg.lambda_max,
         lambda_init=cfg.lambda_init,
 
-        # RMS residual normalization。
+        # Visual residual RMS 对齐。
         use_rms_norm=cfg.use_rms_norm,
         residual_norm_eps=cfg.residual_norm_eps,
         residual_norm_ratio_clip=cfg.residual_norm_ratio_clip,
@@ -130,74 +102,73 @@ def build_model_for_checkpoint(
 
     model = wrapper.wrap(base_model)
 
-    # ---------------------------------------------------------
-    # 加载当前 Stage 2 checkpoint 的 LoRA 权重
-    # ---------------------------------------------------------
-    lora_state_dict = load_file(lora_path)
-
+    # 加载当前 checkpoint 的 LoRA 参数。
     set_peft_model_state_dict(
         model,
-        lora_state_dict,
+        load_file(
+            os.path.join(
+                weights_path,
+                "adapter_model.safetensors",
+            )
+        ),
     )
 
-    # ---------------------------------------------------------
-    # A1～A5：加载当前 checkpoint 的 visual adapter
-    # A0：没有 visual adapter，因此跳过
-    # ---------------------------------------------------------
+    # A0 不启用 Visual Adapter，因此不加载 visual_adapter.pt。
     if cfg.enable_visual_adapter:
-        visual_adapter_path = os.path.join(
-            weights_path,
-            "visual_adapter.pt",
-        )
-
-        if not os.path.isfile(visual_adapter_path):
-            print(
-                f"⚠️ 跳过 {weights_path}："
-                f"缺少 visual adapter 权重 {visual_adapter_path}"
-            )
-            del model
-            del base_model
-            torch.cuda.empty_cache()
-            return None
-
-        adapter_module = get_visual_adapter(model)
-
-        if adapter_module is None:
-            raise RuntimeError(
-                "模型中没有找到 visual.res_adapter。"
-            )
-
-        adapter_state_dict = torch.load(
-            visual_adapter_path,
+        state = torch.load(
+            os.path.join(
+                weights_path,
+                "visual_adapter.pt",
+            ),
             map_location="cpu",
         )
 
-        # 不考虑旧版兼容；结构不一致时立即报错。
-        adapter_module.load_state_dict(
-            adapter_state_dict,
+        # strict=True：结构或参数名不一致时立即报错。
+        get_adapter(model).load_state_dict(
+            state,
             strict=True,
         )
 
-    # ---------------------------------------------------------
-    # 评测模式：关闭全部梯度和梯度检查点，开启 KV cache
-    # ---------------------------------------------------------
+    # 评测阶段关闭梯度与 gradient checkpointing，并开启 KV cache。
     model.requires_grad_(False)
-
-    if hasattr(
-        model,
-        "gradient_checkpointing_disable",
-    ):
-        model.gradient_checkpointing_disable()
-
-    if hasattr(model, "config"):
-        model.config.use_cache = True
-
+    model.gradient_checkpointing_disable()
+    model.config.use_cache = True
     model.eval()
 
     return model, base_model
 
 
-def evaluate_single_checkpoint(
+def patch_generate_forward(model):
+    """
+    generate() 会连续多次调用 model.forward()。
+
+    BioMedCLIP 特征已经在每个 batch 生成前计算并缓存到 vision_tower，
+    因此这里移除原始 BioMedCLIP 输入，避免每生成一个 token
+    都重复执行 BioMedCLIP 编码。
+    """
+    def forward(self, *args, **kwargs):
+        kwargs.pop(
+            "biomed_image_tensors",
+            None,
+        )
+        kwargs.pop(
+            "biomed_text_tokens",
+            None,
+        )
+
+        # original_forward 是 Wrapper 保存的 PEFT/Qwen 原始 forward。
+        return self.original_forward(
+            *args,
+            **kwargs,
+        )
+
+    model.forward = types.MethodType(
+        forward,
+        model,
+    )
+
+
+def evaluate_checkpoint(
     weights_path,
     loader,
     processor,
@@ -205,43 +176,50 @@ def evaluate_single_checkpoint(
     test_loader,
     llm_client,
     llm_cfg,
-    biomed_extractor=None,
+    biomed_extractor,
 ):
-    """评测单个 Stage 2 checkpoint。"""
-    print("\n" + "=" * 60)
-    print(
-        "🌟 开始评测 Checkpoint: "
-        f"{os.path.basename(weights_path)}"
+    """
+    完成单个 checkpoint 的完整评测：
+
+    1. 重建并加载模型；
+    2. 在 SLAKE test 上本地生成答案；
+    3. 记录每条样本的 Router / Gate / Lambda；
+    4. 对开放题未严格匹配样本执行 LLM Judge；
+    5. 计算 Closed / Open / Overall Accuracy；
+    6. 保存逐样本 JSONL、CSV 和 summary.json。
+    """
+    name = os.path.basename(weights_path)
+
+    # 每个 checkpoint 拥有独立输出目录。
+    output_dir = os.path.join(
+        cfg.output_dir,
+        name,
     )
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
+
+    print("\n" + "=" * 60)
+    print(f"开始评测：{name}")
+    print(f"输出目录：{output_dir}")
     print("=" * 60)
 
-    built_model = build_model_for_checkpoint(
-        weights_path=weights_path,
-        loader=loader,
-        cfg=cfg,
-        biomed_extractor=biomed_extractor,
+    model, base_model = build_model(
+        weights_path,
+        loader,
+        cfg,
+        biomed_extractor,
     )
 
-    if built_model is None:
-        return None
+    # A0 没有 Visual Adapter，其余消融读取对应模块。
+    adapter = (
+        get_adapter(model)
+        if cfg.enable_visual_adapter
+        else None
+    )
 
-    model, base_model = built_model
-
-    # 获取三尺度 MoRA_Med visual adapter，
-    # 用于读取推理过程中产生的路由权重。
-    adapter_module = None
-
-    if cfg.enable_visual_adapter:
-        adapter_module = get_visual_adapter(
-            model
-        )
-
-        if adapter_module is None:
-            raise RuntimeError(
-                "启用了 visual adapter，"
-                "但没有找到 visual.res_adapter。"
-            )
-
+    # Qwen3-VL 视觉塔，用于写入和清空 BioMedCLIP 缓存。
     vision_tower = (
         model.base_model
         .model
@@ -249,102 +227,31 @@ def evaluate_single_checkpoint(
         .visual
     )
 
+    # 以视觉塔参数所在设备和 dtype 为准。
     ref_param = next(
         vision_tower.parameters()
     )
+    device = ref_param.device
+    adapter_dtype = ref_param.dtype
 
-    model_device = ref_param.device
-
-    adapter_dtype = (
-        ref_param.dtype
-        if ref_param.is_floating_point()
-        else torch.bfloat16
-    )
-
-    # =========================================================
-    # 推理专用 BioMedCLIP 缓存桥
-    # =========================================================
-    # 新版 Wrapper 已经负责 patch 视觉塔。
-    # 训练时，Wrapper 的外层 forward 会从输入中提取 BioMedCLIP
-    # 输入并计算特征；但 generate() 会连续执行多次 forward。
-    #
-    # 评测时在每个 batch 开始前只计算一次 BioMedCLIP 特征，
-    # 并缓存到 vision_tower；随后让 generate() 的多次 forward
-    # 直接复用这些缓存特征，避免每生成一个 token 都重复编码。
     if cfg.enable_visual_adapter:
-        def eval_model_forward(
-            self,
-            *args,
-            **kwargs,
-        ):
-            kwargs.pop(
-                "biomed_image_tensors",
-                None,
-            )
-            kwargs.pop(
-                "biomed_text_tokens",
-                None,
-            )
+        patch_generate_forward(model)
 
-            # original_forward 是 Wrapper 在 wrap() 时保存的
-            # PEFT/Qwen 原始 forward；调用它不会重新清空缓存特征。
-            return self.original_forward(
-                *args,
-                **kwargs,
-            )
-
-        model.forward = types.MethodType(
-            eval_model_forward,
-            model,
-        )
+    # 保存所有图文对的预测、标准答案和路由诊断。
+    records = []
 
     # =========================================================
-    # Phase 1：本地生成与严格匹配统计
+    # Phase 1：本地生成
     # =========================================================
-    metrics = {
-        "total": 0,
-        "norm_match": 0,
-        "closed_total": 0,
-        "closed_correct": 0,
-        "open_total": 0,
-        "open_correct": 0,
-    }
-    all_records = []
-    # ---------------------------------------------------------
-    # 三尺度路由诊断记录
-    # ---------------------------------------------------------
-    # routing_weight_records:
-    #   每个图文对的 Conv2D F3/F5/F7 权重。
-    #
-    # gate_records:
-    #   每个图文对的 soft residual gate。
-    #
-    # lambda_records:
-    #   当前 checkpoint 的全局 lambda。
-    #   为方便逐样本对齐，会在每个 batch 内复制。
-    #
-    # effective_scale_records:
-    #   每个图文对实际使用的 lambda * gate。
-    routing_weight_records = []
-    gate_records = []
-    lambda_records = []
-    effective_scale_records = []
-
     with torch.no_grad():
-        for batch_inputs, metadata_list in tqdm(
+        for batch_inputs, metadata in tqdm(
             test_loader,
             desc="Local Inference",
         ):
-            # 当前 batch 的逐样本诊断信息。
-            # A0 或未启用 visual adapter 时保持为 None。
-            batch_routing_weights = None
-            batch_gates = None
-            batch_lambdas = None
-            batch_effective_scales = None
-
+            # 将 Tensor 输入移动到模型所在设备。
             inputs = {
                 key: (
-                    value.to(model_device)
+                    value.to(device)
                     if isinstance(value, torch.Tensor)
                     else value
                 )
@@ -352,506 +259,259 @@ def evaluate_single_checkpoint(
             }
 
             if cfg.enable_visual_adapter:
-                biomed_img = inputs.pop(
+                # BioMedCLIP 图像使用模型浮点 dtype；
+                # 文本 token 保持整数 dtype。
+                image = inputs.pop(
                     "biomed_image_tensors"
-                )
-                biomed_txt = inputs.pop(
+                ).to(adapter_dtype)
+
+                text = inputs.pop(
                     "biomed_text_tokens"
                 )
 
-                # BioMedCLIP 图像输入使用模型浮点 dtype；
-                # 文本 token 保持原始整数 dtype。
-                biomed_img = biomed_img.to(
-                    dtype=adapter_dtype
-                )
-
-                img_feat, txt_feat = (
+                # 每个 batch 只计算一次 BioMedCLIP 图像和文本特征。
+                image_feat, text_feat = (
                     model.biomed_extractor(
-                        biomed_img,
-                        biomed_txt,
+                        image,
+                        text,
                     )
                 )
 
+                # 缓存到视觉塔，供 generate() 内部多次 forward 复用。
                 vision_tower.current_biomed_img_feat = (
-                    img_feat
+                    image_feat
                 )
                 vision_tower.current_biomed_txt_feat = (
-                    txt_feat
+                    text_feat
                 )
 
-            generation_kwargs = {
-                "max_new_tokens": cfg.max_new_tokens,
+            # 贪心解码时只传必要参数。
+            generate_args = {
+                "max_new_tokens": (
+                    cfg.max_new_tokens
+                ),
                 "do_sample": cfg.do_sample,
             }
 
-            # 贪心解码时不传 temperature，避免无效参数警告。
             if cfg.do_sample:
-                generation_kwargs["temperature"] = (
+                generate_args["temperature"] = (
                     cfg.temperature
                 )
 
-            generated_ids = model.generate(
+            generated = model.generate(
                 **inputs,
-                **generation_kwargs,
+                **generate_args,
             )
 
-            # =========================================================
-            # 收集当前 batch 的三尺度 routing / gate / lambda
-            # =========================================================
-            # 必须在清空 BioMedCLIP 缓存之前完成。
-            if (
-                    cfg.enable_visual_adapter
-                    and adapter_module is not None
-            ):
-                routing_weights = getattr(
-                    adapter_module,
-                    "latest_routing_weights",
-                    None,
-                )
-                soft_gate = getattr(
-                    adapter_module,
-                    "latest_soft_gate",
-                    None,
-                )
-                lambda_value = getattr(
-                    adapter_module,
-                    "latest_lambda",
-                    None,
-                )
-
-                if routing_weights is None:
-                    raise RuntimeError(
-                        "没有获取到 latest_routing_weights，"
-                        "请确认 Fusion 前向是否保存了该属性。"
-                    )
-
-                if soft_gate is None:
-                    raise RuntimeError(
-                        "没有获取到 latest_soft_gate，"
-                        "请确认 Fusion 前向是否保存了该属性。"
-                    )
-
-                if lambda_value is None:
-                    raise RuntimeError(
-                        "没有获取到 latest_lambda，"
-                        "请确认 Fusion 前向是否保存了该属性。"
-                    )
-
-                batch_size = len(metadata_list)
-
-                # -----------------------------------------------------
-                # 路由权重：[B, 3]，依次对应 F3/F5/F7
-                # -----------------------------------------------------
-                batch_routing_weights = (
-                    routing_weights
+            if cfg.enable_visual_adapter:
+                # Fusion 前向会保存当前 batch 的路由结果。
+                #
+                # routing: [B, 3]，依次对应 F3 / F5 / F7。
+                # gate:    [B]，每个图文对一个样本级 Gate。
+                # lambda:  标量，全局共享。
+                routing = (
+                    adapter
+                    .latest_routing_weights
                     .detach()
                     .float()
                     .cpu()
                 )
 
-                if (
-                        batch_routing_weights.ndim != 2
-                        or batch_routing_weights.shape
-                        != (batch_size, 3)
-                ):
-                    raise RuntimeError(
-                        "三尺度 routing weights 形状错误："
-                        f"当前为 "
-                        f"{tuple(batch_routing_weights.shape)}，"
-                        f"预期为 ({batch_size}, 3)。"
-                    )
-
-                # -----------------------------------------------------
-                # 样本级 gate：[B]
-                # -----------------------------------------------------
-                batch_gates = (
-                    soft_gate
+                gate = (
+                    adapter
+                    .latest_soft_gate
                     .detach()
                     .float()
                     .reshape(-1)
                     .cpu()
                 )
 
-                if batch_gates.shape != (batch_size,):
-                    raise RuntimeError(
-                        "residual gate 形状错误："
-                        f"当前为 {tuple(batch_gates.shape)}，"
-                        f"预期为 ({batch_size},)。"
-                    )
-
-                # -----------------------------------------------------
-                # 全局共享 lambda：标量
-                # -----------------------------------------------------
-                lambda_cpu = (
-                    lambda_value
+                lambda_value = float(
+                    adapter
+                    .latest_lambda
                     .detach()
                     .float()
                     .cpu()
+                    .item()
                 )
 
-                if lambda_cpu.numel() != 1:
+                batch_size = len(metadata)
+
+                # 若维度不符合当前三专家设计，直接终止评测。
+                if routing.shape != (
+                    batch_size,
+                    3,
+                ):
                     raise RuntimeError(
-                        "当前设计中的 lambda 应为标量，"
-                        f"实际形状为 "
-                        f"{tuple(lambda_cpu.shape)}。"
+                        f"routing shape="
+                        f"{tuple(routing.shape)}, "
+                        f"expected=({batch_size}, 3)"
                     )
 
-                lambda_scalar = float(
-                    lambda_cpu.item()
+                if gate.shape != (
+                    batch_size,
+                ):
+                    raise RuntimeError(
+                        f"gate shape="
+                        f"{tuple(gate.shape)}, "
+                        f"expected=({batch_size},)"
+                    )
+
+                # 当前 batch 使用结束后清空缓存，
+                # 防止特征错误复用到下一批样本。
+                vision_tower.current_biomed_img_feat = (
+                    None
+                )
+                vision_tower.current_biomed_txt_feat = (
+                    None
                 )
 
-                # lambda 是全局共享参数。
-                # 这里复制为 [B]，只是为了与每个样本一一对应。
-                batch_lambdas = torch.full(
-                    (batch_size,),
-                    fill_value=lambda_scalar,
-                    dtype=torch.float32,
-                )
+            else:
+                routing = None
+                gate = None
+                lambda_value = None
 
-                # 每个图文对实际使用的残差系数 λg。
-                batch_effective_scales = (
-                        batch_gates
-                        * batch_lambdas
-                )
-
-                routing_weight_records.append(
-                    batch_routing_weights
-                )
-                gate_records.append(
-                    batch_gates
-                )
-                lambda_records.append(
-                    batch_lambdas
-                )
-                effective_scale_records.append(
-                    batch_effective_scales
-                )
-
-            if cfg.enable_visual_adapter:
-                # 当前 batch 完成后立即清空，
-                # 防止 BioMedCLIP 特征残留到下一批。
-                vision_tower.current_biomed_img_feat = None
-                vision_tower.current_biomed_txt_feat = None
-
-            generated_ids_trimmed = [
-                output_ids[len(input_ids):]
-                for input_ids, output_ids in zip(
+            # model.generate() 返回：
+            # [输入 prompt token + 新生成 token]。
+            # 这里只保留新生成的答案部分。
+            generated = [
+                output[len(input_ids):]
+                for input_ids, output in zip(
                     inputs["input_ids"],
-                    generated_ids,
+                    generated,
                 )
             ]
 
-            output_texts = processor.batch_decode(
-                generated_ids_trimmed,
+            predictions = processor.batch_decode(
+                generated,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
 
-            for index, raw_pred in enumerate(output_texts):
-                meta = metadata_list[index]
+            # 将当前 batch 拆成逐样本记录。
+            for i, prediction in enumerate(
+                predictions
+            ):
+                meta = metadata[i]
 
                 gt_raw = meta.get(
                     "gt_answer",
                     meta.get("answer", ""),
                 )
 
-                answer_type = (
-                    meta.get("answer_type", "")
-                    .strip()
-                    .upper()
+                # 统一清洗 GT 和预测答案后进行严格匹配。
+                gt_norm = (
+                    slake_answer_eval_cleaning(
+                        gt_raw
+                    )
                 )
-                is_closed_question = (
-                    answer_type == "CLOSED"
+                pred_norm = (
+                    slake_answer_eval_cleaning(
+                        prediction
+                    )
                 )
-
-                pred_norm = slake_answer_eval_cleaning(
-                    raw_pred
-                )
-                gt_norm = slake_answer_eval_cleaning(
-                    gt_raw
-                )
-                is_norm_match = (
+                matched = (
                     pred_norm == gt_norm
                 )
 
-                metrics["total"] += 1
-
-                if is_norm_match:
-                    metrics["norm_match"] += 1
-
-                if is_closed_question:
-                    metrics["closed_total"] += 1
-                    if is_norm_match:
-                        metrics["closed_correct"] += 1
-                else:
-                    metrics["open_total"] += 1
-                    if is_norm_match:
-                        metrics["open_correct"] += 1
-
-                all_records.append(
-                    {
-                        "index": meta.get(
-                            "index"
-                        ),
-                        "image_path": meta.get(
-                            "image_path"
-                        ),
-                        "question": meta["question"],
-                        "gt_raw": gt_raw,
-                        "gt_norm": gt_norm,
-                        "pred_raw": raw_pred.strip(),
-                        "pred_norm": pred_norm,
-                        "is_norm_match": is_norm_match,
-                        "question_category": (
-                            "closed"
-                            if is_closed_question
-                            else "open"
-                        ),
-
-                        # =================================================
-                        # 三尺度路由诊断
-                        # =================================================
-                        "routing_f3": (
-                            float(
-                                batch_routing_weights[
-                                    index,
-                                    0,
-                                ].item()
-                            )
-                            if batch_routing_weights is not None
-                            else None
-                        ),
-
-                        "routing_f5": (
-                            float(
-                                batch_routing_weights[
-                                    index,
-                                    1,
-                                ].item()
-                            )
-                            if batch_routing_weights is not None
-                            else None
-                        ),
-
-                        "routing_f7": (
-                            float(
-                                batch_routing_weights[
-                                    index,
-                                    2,
-                                ].item()
-                            )
-                            if batch_routing_weights is not None
-                            else None
-                        ),
-
-
-                        # 图文对级 soft gate。
-                        "residual_gate": (
-                            float(
-                                batch_gates[
-                                    index
-                                ].item()
-                            )
-                            if batch_gates is not None
-                            else None
-                        ),
-
-                        # 全局共享 lambda；
-                        # 此处复制到每个样本记录中，方便后续导出与分析。
-                        "lambda_value": (
-                            float(
-                                batch_lambdas[
-                                    index
-                                ].item()
-                            )
-                            if batch_lambdas is not None
-                            else None
-                        ),
-
-                        # 当前图文对的实际残差系数 λg。
-                        "effective_residual_scale": (
-                            float(
-                                batch_effective_scales[
-                                    index
-                                ].item()
-                            )
-                            if batch_effective_scales
-                               is not None
-                            else None
-                        ),
-                    }
+                # SLAKE 中 CLOSED 通常对应 yes/no 等封闭式问题；
+                # 其余归为 OPEN。
+                category = (
+                    "closed"
+                    if (
+                        meta.get(
+                            "answer_type",
+                            "",
+                        )
+                        .strip()
+                        .upper()
+                        == "CLOSED"
+                    )
+                    else "open"
                 )
 
-    # =========================================================
-    # 三尺度 routing / gate / lambda 总体统计
-    # =========================================================
-    if routing_weight_records:
-        all_routing_weights = torch.cat(
-            routing_weight_records,
-            dim=0,
-        )
-        all_gates = torch.cat(
-            gate_records,
-            dim=0,
-        )
-        all_lambdas = torch.cat(
-            lambda_records,
-            dim=0,
-        )
-        all_effective_scales = torch.cat(
-            effective_scale_records,
-            dim=0,
-        )
+                record = {
+                    "index": meta.get("index"),
+                    "image_path": meta.get(
+                        "image_path"
+                    ),
+                    "question": meta["question"],
+                    "question_category": category,
 
-        num_records = len(all_records)
+                    # 原始答案和清洗后的答案。
+                    "gt_raw": gt_raw,
+                    "gt_norm": gt_norm,
+                    "pred_raw": prediction.strip(),
+                    "pred_norm": pred_norm,
 
-        if all_routing_weights.shape != (
-                num_records,
-                3,
-        ):
-            raise RuntimeError(
-                "路由记录数量或维度异常："
-                f"routing="
-                f"{tuple(all_routing_weights.shape)}，"
-                f"预期为 ({num_records}, 3)。"
-            )
+                    # 本地字符串严格匹配结果。
+                    "is_norm_match": matched,
 
-        if all_gates.shape != (
-                num_records,
-        ):
-            raise RuntimeError(
-                "gate 记录数量异常："
-                f"gate={tuple(all_gates.shape)}，"
-                f"预期为 ({num_records},)。"
-            )
+                    # 开放题未严格匹配时，由 LLM Judge 补充。
+                    "llm_judge_score": None,
+                    "llm_judge_reason": None,
 
-        if all_lambdas.shape != (
-                num_records,
-        ):
-            raise RuntimeError(
-                "lambda 记录数量异常："
-                f"lambda={tuple(all_lambdas.shape)}，"
-                f"预期为 ({num_records},)。"
-            )
+                    # 默认使用严格匹配结果；
+                    # LLM Judge 后可能被更新。
+                    "final_correct": matched,
 
-        # -----------------------------------------------------
-        # 三尺度平均权重
-        # -----------------------------------------------------
-        mean_scale_weights = (
-            all_routing_weights.mean(
-                dim=0
-            )
-        )
+                    # A0 中以下诊断字段保持 None。
+                    "routing_f3": None,
+                    "routing_f5": None,
+                    "routing_f7": None,
+                    "residual_gate": None,
+                    "lambda_value": None,
+                    "effective_residual_scale": None,
+                }
 
-        # -----------------------------------------------------
-        # 路由熵
-        # -----------------------------------------------------
-        safe_weights = (
-            all_routing_weights
-            .clamp_min(1e-12)
-        )
+                if routing is not None:
+                    record["routing_f3"] = float(
+                        routing[i, 0]
+                    )
+                    record["routing_f5"] = float(
+                        routing[i, 1]
+                    )
+                    record["routing_f7"] = float(
+                        routing[i, 2]
+                    )
 
-        routing_entropy = -(
-                safe_weights
-                * safe_weights.log()
-        ).sum(dim=-1)
+                    record["residual_gate"] = float(
+                        gate[i]
+                    )
+                    record["lambda_value"] = (
+                        lambda_value
+                    )
 
-        normalized_entropy = (
-                routing_entropy.mean().item()
-                / math.log(3)
-        )
+                    # 当前样本实际使用的整体残差系数。
+                    record[
+                        "effective_residual_scale"
+                    ] = (
+                        lambda_value
+                        * float(gate[i])
+                    )
 
-        # -----------------------------------------------------
-        # gate 与有效残差系数的分位数
-        # -----------------------------------------------------
-        quantile_levels = torch.tensor(
-            [0.1, 0.5, 0.9],
-            dtype=torch.float32,
-        )
+                records.append(record)
 
-        gate_quantiles = torch.quantile(
-            all_gates,
-            quantile_levels,
-        )
-
-        effective_quantiles = torch.quantile(
-            all_effective_scales,
-            quantile_levels,
-        )
-
-        print("\n" + "=" * 70)
-        print(
-            "三尺度路由诊断 | "
-            f"checkpoint="
-            f"{os.path.basename(weights_path)}"
-        )
-        print("=" * 70)
-
-        print(
-            "平均专家权重："
-            f"F3={mean_scale_weights[0].item():.6f}, "
-            f"F5={mean_scale_weights[1].item():.6f}, "
-            f"F7={mean_scale_weights[2].item():.6f}"
-        )
-
-        print(
-            "residual gate："
-            f"mean={all_gates.mean().item():.6f}, "
-            f"std={all_gates.std(unbiased=False).item():.6f}, "
-            f"P10={gate_quantiles[0].item():.6f}, "
-            f"P50={gate_quantiles[1].item():.6f}, "
-            f"P90={gate_quantiles[2].item():.6f}"
-        )
-
-        print(
-            "lambda："
-            f"mean={all_lambdas.mean().item():.6f}, "
-            f"min={all_lambdas.min().item():.6f}, "
-            f"max={all_lambdas.max().item():.6f}"
-        )
-
-        print(
-            "lambda × gate："
-            f"mean="
-            f"{all_effective_scales.mean().item():.6f}, "
-            f"std="
-            f"{all_effective_scales.std(unbiased=False).item():.6f}, "
-            f"P10="
-            f"{effective_quantiles[0].item():.6f}, "
-            f"P50="
-            f"{effective_quantiles[1].item():.6f}, "
-            f"P90="
-            f"{effective_quantiles[2].item():.6f}"
-        )
-
-        print(
-            "路由 entropy："
-            f"mean={routing_entropy.mean().item():.6f}, "
-            f"归一化={normalized_entropy:.6f}"
-        )
-
-        print("=" * 70)
-
-    # 本地生成完成后释放当前 checkpoint 模型显存。
+    # 本地生成结束后释放大模型显存。
     del model
     del base_model
     torch.cuda.empty_cache()
 
     # =========================================================
-    # Phase 2：LLM Judge 评估开放题语义正确性
+    # Phase 2：LLM Judge
     # =========================================================
-    semantic_rescued_strict = 0
-    semantic_rescued_relaxed = 0
-
     for record in tqdm(
-        all_records,
+        records,
         desc="LLM Judging",
     ):
+        # Closed 问题只使用严格匹配；
+        # Open 问题严格匹配失败时才调用 LLM Judge。
         if (
-            record["question_category"] == "open"
+            record["question_category"]
+            == "open"
             and not record["is_norm_match"]
         ):
-            user_prompt = build_llm_judge_user_prompt(
+            prompt = build_llm_judge_user_prompt(
                 question=record["question"],
                 gt_raw=record["gt_raw"],
                 gt_norm=record["gt_norm"],
@@ -859,113 +519,376 @@ def evaluate_single_checkpoint(
                 pred_norm=record["pred_norm"],
             )
 
-            raw_response = llm_client.ask(
+            response = llm_client.ask(
                 llm_cfg.vqa_rad_llm_judge_system_prompt,
-                user_prompt,
+                prompt,
                 temperature=0.0,
             )
 
-            parsed_result = parse_llm_judge_response(
-                raw_response
+            judged = parse_llm_judge_response(
+                response
             )
 
-            if parsed_result["score"] == "correct":
-                semantic_rescued_strict += 1
-                semantic_rescued_relaxed += 1
-            elif parsed_result["score"] == "partially_correct":
-                semantic_rescued_relaxed += 1
+            record["llm_judge_score"] = (
+                judged["score"]
+            )
+            record["llm_judge_reason"] = (
+                judged.get("reason")
+                or judged.get("explanation")
+            )
 
-    open_semantic_strict_correct = (
-        metrics["open_correct"]
-        + semantic_rescued_strict
-    )
+            # 当前 strict 指标只把 correct 计为正确；
+            # partially_correct 不计入最终准确率。
+            record["final_correct"] = (
+                judged["score"] == "correct"
+            )
 
-    overall_strict_acc = (
-        (
-            metrics["closed_correct"]
-            + open_semantic_strict_correct
+    # =========================================================
+    # Phase 3：准确率统计
+    # =========================================================
+    closed = [
+        item
+        for item in records
+        if (
+            item["question_category"]
+            == "closed"
         )
-        / metrics["total"]
-        if metrics["total"]
-        else 0.0
+    ]
+
+    opened = [
+        item
+        for item in records
+        if (
+            item["question_category"]
+            == "open"
+        )
+    ]
+
+    closed_correct = sum(
+        item["final_correct"]
+        for item in closed
     )
 
-    return {
-        "checkpoint": os.path.basename(weights_path),
+    open_correct = sum(
+        item["final_correct"]
+        for item in opened
+    )
+
+    result = {
+        "checkpoint": name,
         "closed_acc": (
-            metrics["closed_correct"]
-            / metrics["closed_total"]
-            if metrics["closed_total"]
-            else 0.0
+            closed_correct / len(closed)
         ),
         "open_strict_acc": (
-            open_semantic_strict_correct
-            / metrics["open_total"]
-            if metrics["open_total"]
-            else 0.0
+            open_correct / len(opened)
         ),
-        "overall_strict_acc": overall_strict_acc,
+        "overall_strict_acc": (
+            closed_correct
+            + open_correct
+        ) / len(records),
     }
+
+    # =========================================================
+    # Phase 4：Router / Gate / Lambda 诊断
+    # =========================================================
+    if cfg.enable_visual_adapter:
+        # 将逐样本记录重新整理为 Tensor，计算整体统计。
+        routing = torch.tensor(
+            [
+                [
+                    item["routing_f3"],
+                    item["routing_f5"],
+                    item["routing_f7"],
+                ]
+                for item in records
+            ]
+        )
+
+        gates = torch.tensor(
+            [
+                item["residual_gate"]
+                for item in records
+            ]
+        )
+
+        effective = torch.tensor(
+            [
+                item[
+                    "effective_residual_scale"
+                ]
+                for item in records
+            ]
+        )
+
+        # H(w) = -sum(w * log(w))。
+        # 三专家最大熵为 log(3)。
+        safe_routing = routing.clamp_min(
+            1e-12
+        )
+        entropy = -(
+            safe_routing
+            * safe_routing.log()
+        ).sum(dim=-1)
+
+        mean_weights = routing.mean(
+            dim=0
+        )
+
+        gate_q = torch.quantile(
+            gates,
+            torch.tensor(
+                [0.1, 0.5, 0.9]
+            ),
+        )
+
+        effective_q = torch.quantile(
+            effective,
+            torch.tensor(
+                [0.1, 0.5, 0.9]
+            ),
+        )
+
+        # 同时写入 summary.json。
+        result["routing"] = {
+            "mean_f3": float(
+                mean_weights[0]
+            ),
+            "mean_f5": float(
+                mean_weights[1]
+            ),
+            "mean_f7": float(
+                mean_weights[2]
+            ),
+            "gate_mean": float(
+                gates.mean()
+            ),
+            "gate_std": float(
+                gates.std(
+                    unbiased=False
+                )
+            ),
+            "lambda": records[0][
+                "lambda_value"
+            ],
+            "effective_mean": float(
+                effective.mean()
+            ),
+            "effective_std": float(
+                effective.std(
+                    unbiased=False
+                )
+            ),
+            "entropy_mean": float(
+                entropy.mean()
+            ),
+            "entropy_normalized": float(
+                entropy.mean()
+                / math.log(3)
+            ),
+        }
+
+        print("\n" + "=" * 70)
+        print(
+            "三尺度路由诊断 | "
+            f"checkpoint={name}"
+        )
+        print("=" * 70)
+
+        print(
+            "平均专家权重："
+            f"F3={mean_weights[0]:.6f}, "
+            f"F5={mean_weights[1]:.6f}, "
+            f"F7={mean_weights[2]:.6f}"
+        )
+
+        print(
+            "residual gate："
+            f"mean={gates.mean():.6f}, "
+            f"std="
+            f"{gates.std(unbiased=False):.6f}, "
+            f"P10={gate_q[0]:.6f}, "
+            f"P50={gate_q[1]:.6f}, "
+            f"P90={gate_q[2]:.6f}"
+        )
+
+        print(
+            f"lambda："
+            f"{records[0]['lambda_value']:.6f}"
+        )
+
+        print(
+            "lambda × gate："
+            f"mean={effective.mean():.6f}, "
+            f"std="
+            f"{effective.std(unbiased=False):.6f}, "
+            f"P10={effective_q[0]:.6f}, "
+            f"P50={effective_q[1]:.6f}, "
+            f"P90={effective_q[2]:.6f}"
+        )
+
+        print(
+            "路由 entropy："
+            f"mean={entropy.mean():.6f}, "
+            f"归一化="
+            f"{entropy.mean() / math.log(3):.6f}"
+        )
+
+        print("=" * 70)
+
+    # =========================================================
+    # Phase 5：输出逐样本记录和汇总结果
+    # =========================================================
+
+    # JSONL：一行一个样本，适合后续 Python 逐行读取。
+    jsonl_path = os.path.join(
+        output_dir,
+        "samples.jsonl",
+    )
+
+    with open(
+        jsonl_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        for record in records:
+            file.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    # CSV：方便 Excel、Pandas 或统计软件查看。
+    csv_path = os.path.join(
+        output_dir,
+        "samples.csv",
+    )
+
+    with open(
+        csv_path,
+        "w",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=list(
+                records[0].keys()
+            ),
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+    # 当前 checkpoint 的整体指标与路由统计。
+    summary_path = os.path.join(
+        output_dir,
+        "summary.json",
+    )
+
+    with open(
+        summary_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            result,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(
+        f"逐样本 JSONL："
+        f"{jsonl_path}"
+    )
+    print(
+        f"逐样本 CSV："
+        f"{csv_path}"
+    )
+    print(
+        f"汇总 JSON："
+        f"{summary_path}"
+    )
+
+    return result
+
+
+def get_checkpoints(cfg):
+    """
+    根据配置返回需要评测的权重目录。
+
+    eval_final_weights_only=True：
+        只返回 final_weights。
+
+    eval_final_weights_only=False：
+        按 step 顺序返回 checkpoint-*，
+        最后追加 final_weights。
+    """
+    final_weights = os.path.join(
+        cfg.stage2_run_dir,
+        "final_weights",
+    )
+
+    if cfg.eval_final_weights_only:
+        return [final_weights]
+
+    checkpoints = glob.glob(
+        os.path.join(
+            cfg.stage2_run_dir,
+            "checkpoint-*",
+        )
+    )
+
+    checkpoints.sort(
+        key=lambda path: int(
+            path.rsplit(
+                "-",
+                1,
+            )[-1]
+        )
+    )
+
+    checkpoints.append(
+        final_weights
+    )
+
+    return checkpoints
 
 
 def main():
     cfg = Stage2EvalConfig()
 
-    # =========================================================
-    # 1. 扫描当前 Stage 2 run 下的 checkpoint 与 final_weights
-    # =========================================================
-    base_weight_dir = cfg.stage2_run_dir
-
-    checkpoint_dirs = glob.glob(
-        os.path.join(
-            base_weight_dir,
-            "checkpoint-*",
-        )
+    # 创建当前实验统一评测目录。
+    os.makedirs(
+        cfg.output_dir,
+        exist_ok=True,
     )
 
-    checkpoint_dirs.sort(
-        key=lambda path: int(
-            path.rsplit("-", 1)[-1]
-        )
+    checkpoints = get_checkpoints(
+        cfg
     )
 
-    final_weights_path = os.path.join(
-        base_weight_dir,
-        "final_weights",
-    )
-
-    if os.path.isdir(final_weights_path):
-        checkpoint_dirs.append(
-            final_weights_path
-        )
-
-    if not checkpoint_dirs:
-        print(
-            f"❌ 在 {base_weight_dir} 下没有找到任何 "
-            "checkpoint-* 或 final_weights 目录。"
-        )
-        return
-    #零时测试，只跑最后一个checkpoints
-    checkpoint_dirs=checkpoint_dirs[-1:]
     print(
-        f"🔍 发现 {len(checkpoint_dirs)} 个 SLAKE 评测节点 | "
-        f"消融={cfg.ablation_id}"
+        f"发现 {len(checkpoints)} "
+        "个评测节点："
     )
 
-    for checkpoint_path in checkpoint_dirs:
+    for path in checkpoints:
         print(
-            "  - "
-            f"{os.path.basename(checkpoint_path)}"
+            f"  - {os.path.basename(path)}"
         )
 
     # =========================================================
-    # 2. 初始化底座加载器与 Processor
+    # 1. Qwen3-VL Loader 与 Processor
     # =========================================================
     loader = Qwen3VLQuantizedLoader(
         model_path=cfg.model_name_or_path,
         processor_path=cfg.model_name_or_path,
         load_in_4bit=cfg.load_in_4bit,
-        bnb_4bit_quant_type=cfg.bnb_4bit_quant_type,
+        bnb_4bit_quant_type=(
+            cfg.bnb_4bit_quant_type
+        ),
         bnb_4bit_use_double_quant=(
             cfg.bnb_4bit_use_double_quant
         ),
@@ -973,95 +896,126 @@ def main():
             cfg.bnb_4bit_compute_dtype
         ),
         torch_dtype=cfg.torch_dtype,
-        attn_implementation=cfg.attn_implementation,
+        attn_implementation=(
+            cfg.attn_implementation
+        ),
         device_map="auto",
     )
 
     processor = loader.load_processor()
 
-    # 生成阶段使用左侧 padding，便于批量自回归生成。
-    processor.tokenizer.padding_side = "left"
+    # 批量自回归生成时使用 left padding。
+    processor.tokenizer.padding_side = (
+        "left"
+    )
 
     # =========================================================
-    # 3. A1～A5 加载 BioMedCLIP；A0 跳过
+    # 2. BioMedCLIP
     # =========================================================
     biomed_extractor = None
     biomed_transform = None
     biomed_tokenizer = None
 
+    # A0 不需要 BioMedCLIP，其余启用 Visual Adapter 的实验加载。
     if cfg.enable_visual_adapter:
         (
             biomed_extractor,
             biomed_transform,
             biomed_tokenizer,
         ) = load_biomedclip(
-            biomedclip_path=cfg.biomedclip_path,
+            biomedclip_path=(
+                cfg.biomedclip_path
+            ),
             print_rank=cfg.print_rank,
         )
 
     # =========================================================
-    # 4. 构造 SLAKE test DataLoader
+    # 3. SLAKE Test DataLoader
     # =========================================================
-    test_dataset = SLAKEDataset(
-        json_path=cfg.slake_test_json_path,
-        image_root=cfg.slake_image_root,
+    dataset = SLAKEDataset(
+        json_path=(
+            cfg.slake_test_json_path
+        ),
+        image_root=(
+            cfg.slake_image_root
+        ),
     )
 
-    test_collator = SLAKEEvalCollator(
+    collator = SLAKEEvalCollator(
         processor=processor,
         cfg=cfg,
-        biomed_transform=biomed_transform,
-        biomed_tokenizer=biomed_tokenizer,
+        biomed_transform=(
+            biomed_transform
+        ),
+        biomed_tokenizer=(
+            biomed_tokenizer
+        ),
     )
 
     test_loader = DataLoader(
-        test_dataset,
-        batch_size=cfg.per_device_eval_batch_size,
-        collate_fn=test_collator,
-        num_workers=cfg.dataloader_num_workers,
+        dataset,
+        batch_size=(
+            cfg.per_device_eval_batch_size
+        ),
+        collate_fn=collator,
+        num_workers=(
+            cfg.dataloader_num_workers
+        ),
         shuffle=False,
     )
 
     # =========================================================
-    # 5. 初始化 LLM Judge
+    # 4. LLM Judge
     # =========================================================
     llm_cfg = LLMAPIConfig()
 
     llm_client = GPT5MiniClient(
-        api_key=llm_cfg.gpt_5_mini_key,
+        api_key=(
+            llm_cfg.gpt_5_mini_key
+        ),
         base_url=llm_cfg.base_url,
-        model=llm_cfg.judge_model_name,
+        model=(
+            llm_cfg.judge_model_name
+        ),
     )
 
     # =========================================================
-    # 6. 逐 checkpoint 评测
+    # 5. 逐 checkpoint 评测
     # =========================================================
-    results = []
+    results = [
+        evaluate_checkpoint(
+            path,
+            loader,
+            processor,
+            cfg,
+            test_loader,
+            llm_client,
+            llm_cfg,
+            biomed_extractor,
+        )
+        for path in checkpoints
+    ]
 
-    for checkpoint_path in checkpoint_dirs:
-        result = evaluate_single_checkpoint(
-            weights_path=checkpoint_path,
-            loader=loader,
-            processor=processor,
-            cfg=cfg,
-            test_loader=test_loader,
-            llm_client=llm_client,
-            llm_cfg=llm_cfg,
-            biomed_extractor=biomed_extractor,
+    # 保存所有 checkpoint 的汇总排行榜。
+    leaderboard_path = os.path.join(
+        cfg.output_dir,
+        "leaderboard.json",
+    )
+
+    with open(
+        leaderboard_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            results,
+            file,
+            ensure_ascii=False,
+            indent=2,
         )
 
-        if result is not None:
-            results.append(result)
-
-    if not results:
-        print(
-            "❌ 没有任何 checkpoint 完成评测，"
-            "请检查 LoRA 与 visual_adapter.pt 是否齐全。"
-        )
-        return
-
     # =========================================================
-    # 7. 输出排行榜
+    # 6. 终端输出排行榜
     # =========================================================
     print(
         "\n\n"
@@ -1071,11 +1025,16 @@ def main():
     )
 
     print(
-        f"| 评测节点 ({cfg.ablation_id}) "
-        "| Closed Acc | Open Acc | Overall Acc |"
+        f"| 评测节点 "
+        f"({cfg.ablation_id}) "
+        "| Closed Acc "
+        "| Open Acc "
+        "| Overall Acc |"
     )
+
     print(
-        "| :--- | :---: | :---: | :---: |"
+        "| :--- | :---: "
+        "| :---: | :---: |"
     )
 
     for result in results:
@@ -1086,15 +1045,28 @@ def main():
             f"| {result['overall_strict_acc']:.2%} |"
         )
 
-    best_overall = max(
+    best = max(
         results,
-        key=lambda item: item["overall_strict_acc"],
+        key=lambda item: (
+            item["overall_strict_acc"]
+        ),
     )
 
     print(
-        "\n🎯 最佳节点："
-        f"{best_overall['checkpoint']} "
-        f"(Overall: {best_overall['overall_strict_acc']:.2%})"
+        f"\n最佳节点："
+        f"{best['checkpoint']} "
+        f"(Overall: "
+        f"{best['overall_strict_acc']:.2%})"
+    )
+
+    print(
+        f"评测输出目录："
+        f"{cfg.output_dir}"
+    )
+
+    print(
+        f"排行榜："
+        f"{leaderboard_path}"
     )
 
 
