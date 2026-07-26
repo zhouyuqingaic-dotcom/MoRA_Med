@@ -19,8 +19,8 @@ from utils.data_tools.prompt_cleaning.vqa_rad_answer_cleaning import vqa_rad_ans
 
 # 导入 LLM 裁判相关模块
 from config.LLM_config import LLMAPIConfig
-from LLM_api.gpt_5_mini import GPT5MiniClient
-from LLM_api.prompts.vqa_rad_prompt_builder_gpt_5_mini import build_llm_judge_user_prompt, parse_llm_judge_response
+from LLM_api.deepseek import GPT5MiniClient
+from LLM_api.prompts.vqa_rad_prompt_builder_deepseek import build_llm_judge_user_prompt, parse_llm_judge_response
 
 
 def main():

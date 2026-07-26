@@ -14,8 +14,8 @@ from utils.data_tools.collator.slake.slake_datasets_eval_collator import SLAKEEv
 from utils.data_tools.prompt_cleaning.slake_answer_cleaning import slake_answer_eval_cleaning
 
 from config.LLM_config import LLMAPIConfig
-from LLM_api.gpt_5_mini import GPT5MiniClient
-from LLM_api.prompts.slake_prompt_builder_gpt_5_mini import build_llm_judge_user_prompt, parse_llm_judge_response
+from LLM_api.deepseek import GPT5MiniClient
+from LLM_api.prompts.slake_prompt_builder_deepseek import build_llm_judge_user_prompt, parse_llm_judge_response
 
 
 def evaluate_vanilla_qwen(loader, processor, cfg, test_loader, llm_client, llm_cfg):

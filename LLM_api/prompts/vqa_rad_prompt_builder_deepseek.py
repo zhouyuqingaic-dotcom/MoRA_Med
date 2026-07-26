@@ -3,7 +3,7 @@ import json
 
 def build_llm_judge_user_prompt(question: str, gt_raw: str, gt_norm: str, pred_raw: str, pred_norm: str) -> str:
     """
-    构造传给 GPT-5-mini 裁判的 User Prompt。
+    构造传给 deepseek 裁判的 User Prompt。
     同时传入原始文本(Raw)和规范化文本(Normalized)，让 LLM 有充分的上下文进行裁判。
     """
     user_prompt = (

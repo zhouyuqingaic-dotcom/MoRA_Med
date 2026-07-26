@@ -14,8 +14,8 @@ from tqdm import tqdm
 from config.LLM_config import LLMAPIConfig
 from config.slake.stage2_eval_config_slake import Stage2EvalConfig
 from datas.slake_datasets import SLAKEDataset
-from LLM_api.gpt_5_mini import GPT5MiniClient
-from LLM_api.prompts.slake_prompt_builder_gpt_5_mini import (
+from LLM_api.deepseek import DeepSeekClient
+from LLM_api.prompts.slake_prompt_builder_deepseek import (
     build_llm_judge_user_prompt,
     parse_llm_judge_response,
 )
@@ -450,6 +450,7 @@ def evaluate_checkpoint(
                     # 开放题未严格匹配时，由 LLM Judge 补充。
                     "llm_judge_score": None,
                     "llm_judge_reason": None,
+                    "llm_judge_raw_response": None,
 
                     # 默认使用严格匹配结果；
                     # LLM Judge 后可能被更新。
@@ -520,21 +521,25 @@ def evaluate_checkpoint(
             )
 
             response = llm_client.ask(
-                llm_cfg.vqa_rad_llm_judge_system_prompt,
+                llm_cfg.medical_vqa_llm_judge_system_prompt,
                 prompt,
-                temperature=0.0,
             )
 
             judged = parse_llm_judge_response(
                 response
             )
 
+            record[
+                "llm_judge_raw_response"
+            ] = response
+
             record["llm_judge_score"] = (
                 judged["score"]
             )
             record["llm_judge_reason"] = (
-                judged.get("reason")
-                or judged.get("explanation")
+                    judged.get("reasoning")
+                    or judged.get("reason")
+                    or judged.get("explanation")
             )
 
             # 当前 strict 指标只把 correct 计为正确；
@@ -969,14 +974,15 @@ def main():
     # =========================================================
     llm_cfg = LLMAPIConfig()
 
-    llm_client = GPT5MiniClient(
-        api_key=(
-            llm_cfg.gpt_5_mini_key
-        ),
-        base_url=llm_cfg.base_url,
-        model=(
-            llm_cfg.judge_model_name
-        ),
+    llm_client = DeepSeekClient.from_config(
+        llm_cfg
+    )
+
+    print(
+        "LLM Judge："
+        f"model={llm_cfg.judge_model_name}, "
+        "thinking=disabled, "
+        f"temperature={llm_cfg.temperature}"
     )
 
     # =========================================================

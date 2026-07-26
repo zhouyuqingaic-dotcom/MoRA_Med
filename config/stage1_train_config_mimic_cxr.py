@@ -74,7 +74,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A0" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -177,7 +177,9 @@ class TrainConfig:
 
     # False 表示使用旧 A6 的统一学习率。
     # True 表示使用新的 A6-DLR。
-    use_discriminative_lr: bool = True
+    # use_discriminative_lr: bool = True
+    #跑A0的时候设置为False
+    use_discriminative_lr: bool = False
 
     # 用于输出目录命名。
     lr_recipe_name: str = "DLR"

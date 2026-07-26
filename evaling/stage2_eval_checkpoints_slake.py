@@ -25,8 +25,8 @@ from utils.qwen3vl.qwen3_vl_8B_visual_adapters_fusion import Qwen3VLMoEVisualAda
 from utils.biomedclip.biomed_clip_loader import load_biomedclip
 
 from config.LLM_config import LLMAPIConfig
-from LLM_api.gpt_5_mini import GPT5MiniClient
-from LLM_api.prompts.slake_prompt_builder_gpt_5_mini import build_llm_judge_user_prompt, parse_llm_judge_response
+from LLM_api.deepseek import GPT5MiniClient
+from LLM_api.prompts.slake_prompt_builder_deepseek import build_llm_judge_user_prompt, parse_llm_judge_response
 
 
 def evaluate_single_checkpoint(weights_path, loader, processor, cfg, test_loader, llm_client, llm_cfg,

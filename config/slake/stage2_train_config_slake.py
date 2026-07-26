@@ -40,7 +40,7 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A6" #"A0" #"A5"
+    ablation_id: str = "A0" #"A6" #"A0" #"A5"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -132,12 +132,18 @@ class Stage2TrainConfig:
     # =========================================================
     # A6-DLR 分组学习率
     # =========================================================
+    #使用"A6-DLR"模式时候为true
+    #use_discriminative_lr: bool = True
+    #使用"A0"模式时候设置为False
+    use_discriminative_lr: bool = False
 
-    use_discriminative_lr: bool = True
     lr_recipe_name: str = "DLR"
 
-    # Stage 2 加载的 Stage 1 是否为 DLR 版本。
-    stage1_use_discriminative_lr: bool = True
+    # # Stage 2 加载的 Stage 1 是否为 DLR 版本。
+    # stage1_use_discriminative_lr: bool = True
+    # Stage 2 加载的 Stage 1 是否不为 DLR 版本,这个设置为False。
+    stage1_use_discriminative_lr: bool = False
+
     stage1_lr_recipe_name: str = "DLR"
 
     # 旧统一学习率，同时作为 Trainer 基础/显示学习率。

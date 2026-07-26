@@ -24,8 +24,8 @@ from utils.biomedclip.biomed_clip_loader import load_biomedclip
 
 # 4. 🚀 导入 LLM 裁判组件
 from config.LLM_config import LLMAPIConfig
-from LLM_api.gpt_5_mini import GPT5MiniClient
-from LLM_api.prompts.slake_prompt_builder_gpt_5_mini import build_llm_judge_user_prompt, parse_llm_judge_response
+from LLM_api.deepseek import GPT5MiniClient
+from LLM_api.prompts.slake_prompt_builder_deepseek import build_llm_judge_user_prompt, parse_llm_judge_response
 
 
 def process_single_checkpoint_to_log(weights_path, loader, processor, cfg, test_loader, llm_client, llm_cfg,
