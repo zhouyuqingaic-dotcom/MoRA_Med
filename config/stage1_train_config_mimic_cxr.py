@@ -105,7 +105,10 @@ class TrainConfig:
     # # 过滤清洗后无效的监督文本。
     # mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2"
     #换成生成80k子集(用于快速验证)
-    mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2_screen80k_seed2048"
+    # mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2_screen80k_seed2048"
+    #换成生成160k子集(用于中间规模的实验)
+    mimic_cxr_cache_prefix: str = "mimic_cxr_train_clean_v2_screen160k_seed2048"
+
 
     # MIMIC-CXR 专属指令
     mimic_cxr_instruction_suffix: str = (
@@ -192,7 +195,13 @@ class TrainConfig:
     weight_decay: float = 0.01
 
     lr_scheduler_type: str = "cosine"
-    warmup_steps: int = 100
+    # #80K左右数据的时候为warmup:100
+    # warmup_steps: int = 100
+    # 160k数据的时候为warmup:200
+    warmup_steps: int = 200
+    # 320k数据的时候为warmup:400
+    # warmup_steps: int = 400
+
     max_grad_norm: float = 1.0
 
     logging_steps: int = 10

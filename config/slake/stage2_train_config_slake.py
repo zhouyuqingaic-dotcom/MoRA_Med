@@ -31,10 +31,13 @@ class Stage2TrainConfig:
     # stage1_mimic_cxr_cache_prefix: str = (
     #     "mimic_cxr_train_clean_v2"
     # )
+    # stage1_mimic_cxr_cache_prefix: str = (
+    #     "mimic_cxr_train_clean_v2_screen80k_seed2048"
+    # )
+    # 当前使用 Stage 1 的 160k 中间规模实验
     stage1_mimic_cxr_cache_prefix: str = (
-        "mimic_cxr_train_clean_v2_screen80k_seed2048"
+        "mimic_cxr_train_clean_v2_screen160k_seed2048"
     )
-
 
     # 必须与要加载的 Stage 1 消融保持一致
     ablation_id: str = "A6" #"A0" #"A5"
@@ -154,7 +157,7 @@ class Stage2TrainConfig:
 
     logging_steps: int = 10
     save_steps: int = 500
-    save_total_limit: int = 2
+    save_total_limit: int = 10
 
     gradient_checkpointing: bool = True
     dataloader_num_workers: int = 8

@@ -214,8 +214,11 @@ def main() -> None:
     # 100k 架构筛选：
     #subset_size = 100_000
 
-    # 80k 架构筛选：
-    subset_size = 80_000
+    # # 80k 架构筛选：
+    # subset_size = 80_000
+
+    # 160k 架构筛选：
+    subset_size = 160_000
 
     # 500 条 smoke test 时改成：
     # subset_size = 500
@@ -434,7 +437,7 @@ if __name__ == "__main__":
     main()
 
 """
-/home/yuqing/miniconda3/envs/qwen3vl/bin/python /home/yuqing/RemoteProjects/MoRA_Med/testing/generate_mimic_cxr_cache_subset_same_format.py 
+/home/yuqing/miniconda3/envs/qwen3vl/bin/python /home/yuqing/RemoteProjects/MoRA_Med/other/generate_mimic_cxr_cache_subset_same_format.py 
 当前输出目录为: /home/yuqing/Models/MoRA_Med/Stage1_MIMIC_CXR_A5_Experts-F1-F3-F5_Scale-learned_Gate-learned_Lambda-learnable_RMS-1_Seed-2048
 [MIMICCXRDataset] Loaded cached valid indices: /home/yuqing/Datas/mimic-cxr-jpg-2.1.0/cache/mimic_cxr_train_clean_v2_impression_all_views_drop_empty_valid_indices.json
 [MIMICCXRDataset] Samples after cache filtering: 320016
@@ -465,7 +468,7 @@ Process finished with exit code 0
 
 
 """
-/home/yuqing/miniconda3/envs/qwen3vl/bin/python /home/yuqing/RemoteProjects/MoRA_Med/testing/generate_mimic_cxr_cache_subset_same_format.py 
+/home/yuqing/miniconda3/envs/qwen3vl/bin/python /home/yuqing/RemoteProjects/MoRA_Med/other/generate_mimic_cxr_cache_subset_same_format.py 
 当前输出目录为: /home/yuqing/Models/MoRA_Med/Stage1_MIMIC_CXR_A5_Experts-F1-F3-F5_Scale-learned_Gate-learned_Lambda-learnable_RMS-1_Seed-2048
 [MIMICCXRDataset] Loaded cached valid indices: /home/yuqing/Datas/mimic-cxr-jpg-2.1.0/cache/mimic_cxr_train_clean_v2_impression_all_views_drop_empty_valid_indices.json
 [MIMICCXRDataset] Samples after cache filtering: 320016

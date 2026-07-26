@@ -27,7 +27,7 @@ class Stage2EvalConfig(Stage2TrainConfig):
 
     # True: 只评测 final_weights
     # False: 评测 checkpoint-* 和 final_weights
-    eval_final_weights_only: bool = True
+    eval_final_weights_only: bool = False
 
     # 评测结果根目录
     eval_output_root: str = (
