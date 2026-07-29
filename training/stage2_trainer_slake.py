@@ -132,7 +132,7 @@ class VisualAdapterSaveCallback(TrainerCallback):
     同步保存 RoMA-Net visual adapter。
 
     A0 不包含 visual adapter，因此自动跳过。
-    A1～A5 会在 checkpoint-* 中保存 visual_adapter.pt。
+    A1～A6 会在 checkpoint-* 中保存 visual_adapter.pt。
     """
 
     def __init__(self, enable_visual_adapter: bool):
@@ -300,7 +300,7 @@ def main():
     ddp_print("✅ 底座加载完毕！", print_rank=cfg.print_rank)
 
     # ==========================================
-    # 3. 初始化 BioMedCLIP 引擎 (Dynamic 模式专属)
+    # 3. 根据 enable_visual_adapter 初始化 BioMedCLIP
     # ==========================================
     biomed_extractor = None
     biomed_transform = None
@@ -380,6 +380,7 @@ def main():
     ddp_print(
         "    visual_experts=DWConv2D F3/F5/F7 "
         "(3x3 / 5x5 / 7x7)",
+        print_rank=cfg.print_rank,
     )
 
     peft_model = wrapper.wrap(base_model)
@@ -465,7 +466,6 @@ def main():
             strict=True,
         )
 
-        peft_model.print_trainable_parameters()
 
         ddp_print(
             f"✅ 已加载 Stage 1 visual adapter：{adapter_pt_path}",
@@ -479,6 +479,7 @@ def main():
             print_rank=cfg.print_rank,
         )
 
+    peft_model.print_trainable_parameters()
 
     # ==========================================
     # 5. 🚀 挂载 SLAKE 专属 Collator

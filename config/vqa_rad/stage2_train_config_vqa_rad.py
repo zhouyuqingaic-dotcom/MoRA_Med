@@ -1,38 +1,84 @@
 import os
 from dataclasses import dataclass, field
-from dataclasses import dataclass
-
+from typing import Optional
+from utils.ddp.ddp_utils import ddp_print
 
 @dataclass
 class Stage2TrainConfig:
-    """阶段二 (Stage 2: VQA-RAD) 全局配置类"""
+    """
+    Stage 2：VQA-RAD 微调配置。
 
-    # --- 1. 基础与输出路径配置 ---
-    # 输出目录 (Stage 2 结果)
-    output_dir_with_visual_adapter_dynamic: str = "/home/yuqing/Models/RouterB_Plus_MoA/Stage2_VQA_RAD/dynamic"
-    output_dir_with_visual_adapter_fixed: str = "/home/yuqing/Models/RouterB_Plus_MoA/Stage2_VQA_RAD/fixed"
+    重要原则：
+    - 模型结构必须与加载的 Stage 1 消融结构一致；
+    - Stage 1 和 Stage 2 使用相同的 LoRA 与视觉专家配置；
+    - A6-DLR 继续使用与 SLAKE 相同的分组学习率协议；
+    - BioMedCLIP 始终冻结，仅用于生成路由特征。
+    """
 
-    # ⚠️ 继承 Stage 1 权重的根目录
-    stage1_output_dir_with_visual_adapter_dynamic: str = "/home/yuqing/Models/RouterB_Plus_MoA/with_visual_adapter_dynamic"
-    stage1_output_dir_with_visual_adapter_fixed: str = "/home/yuqing/Models/RouterB_Plus_MoA/with_visual_adapter_fixed"
-
+    # =========================================================
+    # 1. 基础配置
+    # =========================================================
     print_rank: int = 0
-    seed: int = 1912
 
-    # --- 2. VQA-RAD 数据集配置 ---
-    vqa_rad_train_jsonl_path: str = "/home/yuqing/Datas/VQA-RAD/train.jsonl"
-    vqa_rad_test_jsonl_path: str = "/home/yuqing/Datas/VQA-RAD/test.jsonl"
-    vqa_rad_image_root: str = "/home/yuqing/Datas/VQA-RAD/images"
-    vqa_rad_max_size: int = 1024
+    # Stage 2 的随机种子
+    seed: int = 2048
 
-    # 阶段二专属指令
-    vqa_rad_instruction_suffix: str = (
-        "Answer the question briefly and directly based on the image. Use a short medical term or phrase when possible. "
-        "For yes/no questions, answer with yes or no. Do not add unnecessary explanation."
+    # Stage 1 训练时使用的随机种子，用于推导权重目录
+    stage1_seed: int = 2048
+
+    # Stage 1 使用的 MIMIC-CXR 数据缓存前缀。
+    # 必须与 Stage 1 TrainConfig 中的 mimic_cxr_cache_prefix 完全一致。
+    # stage1_mimic_cxr_cache_prefix: str = (
+    #     "mimic_cxr_train_clean_v2"
+    # )
+    # stage1_mimic_cxr_cache_prefix: str = (
+    #     "mimic_cxr_train_clean_v2_screen80k_seed2048"
+    # )
+    # 当前使用 Stage 1 的 160k 中间规模实验
+    stage1_mimic_cxr_cache_prefix: str = (
+        "mimic_cxr_train_clean_v2_screen160k_seed2048"
     )
 
-    # --- 3. 模型与量化配置 ---
-    model_name_or_path: str = "/home/yuqing/Models/Qwen3-VL-8B-Instruct"
+    # 必须与要加载的 Stage 1 消融保持一致
+    ablation_id: str = "A6" #"A6" #"A0" #"A5"
+
+    output_root: str = "/home/yuqing/Models/MoRA_Med"
+
+    # =========================================================
+    # 2. VQA-RAD 数据
+    # =========================================================
+    vqa_rad_train_jsonl_path: str = (
+        "/home/yuqing/Datas/VQA-RAD/train.jsonl"
+    )
+
+    # 训练阶段不会使用，但 EvalConfig 可以继承该字段
+    vqa_rad_test_jsonl_path: str = (
+        "/home/yuqing/Datas/VQA-RAD/test_official.jsonl"
+    )
+
+    vqa_rad_image_root: str = (
+        "/home/yuqing/Datas/VQA-RAD/images"
+    )
+
+    vqa_rad_max_size: int = 1024
+
+    vqa_rad_instruction_suffix: str = (
+        "Answer the question briefly and directly based on the image. "
+        "Use a short medical term or phrase when possible. "
+        "For yes/no questions, answer with yes or no. "
+        "Do not add unnecessary explanation."
+    )
+
+    # Smoke test 时设为 32；正式训练设为 None
+    max_vqa_rad_train_samples: Optional[int] = None
+
+    # =========================================================
+    # 3. Qwen3-VL 与量化配置
+    # =========================================================
+    model_name_or_path: str = (
+        "/home/yuqing/Models/Qwen3-VL-8B-Instruct"
+    )
+
     load_in_4bit: bool = True
     bnb_4bit_quant_type: str = "nf4"
     bnb_4bit_use_double_quant: bool = True
@@ -40,31 +86,24 @@ class Stage2TrainConfig:
     torch_dtype: str = "bfloat16"
     attn_implementation: str = "flash_attention_2"
 
-    # BioMedCLIP 本地绝对路径 (OpenCLIP 格式)
-    biomedclip_path: str = "/home/yuqing/Models/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    # 【新增】：明确指定架构名称，BiomedCLIP 基于 ViT-B-16
-    biomedclip_model_name: str = "ViT-B-16"
+    # =========================================================
+    # 4. BioMedCLIP
+    # =========================================================
+    biomedclip_path: str = (
+        "/home/yuqing/Models/"
+        "BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    )
+
+    use_cross_modal_prior: bool = True
 
     # =========================================================
-    # ✨ 核心创新点：视觉端 (Vision) 的残差适配器
+    # 5. LoRA
+    # 必须与 Stage 1 保持一致
     # =========================================================
-    visual_adapter_hidden_dim: int = 4096  # Qwen3-VL-8B 探测出的真实视觉-语言对齐维度
-    visual_adapter_r: int = 16
-    # 【新增】多尺度 Visual Adapter 与 Router 专属配置
-    # router_mode: str = "dynamic"  # 可选: "dynamic" 或 "fixed"
-    router_mode: str = "fixed"  # 可选: "dynamic" 或 "fixed"
-    global_adapter_kernel_size: int = 1
-    local_adapter_kernel_size: int = 3
-    region_adapter_kernel_size: int = 5
-    #  新增：当 router_mode="fixed" 时的硬融合比例
-    fixed_weights: list[float] = field(default_factory=lambda: [0.33, 0.33, 0.34])
-    # 🚀 【新增】全局 MoE 残差缩放因子，对齐 Single Adapter 的强度
-    moe_alpha: float = 0 #0.1 #0.2 #0.3 #0.4 #0.7 #0.8 #0.5 #0.6 #0.9 #1
-    
-    # --- 4. LoRA 配置 ---
     lora_r: int = 64
     lora_alpha: int = 128
     lora_dropout: float = 0.05
+
     lora_target_modules: list[str] = field(
         default_factory=lambda: [
             "q_proj",
@@ -77,47 +116,332 @@ class Stage2TrainConfig:
         ]
     )
 
-    # --- 5. 训练超参数 (针对 VQA-RAD 小数据集微调) ---
-    per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 2
-    num_train_epochs: float = 5.0  # VQA-RAD 数据量小，Epoch 适当拉大
-    learning_rate: float = 1e-5  # 学习率比 Stage 1 略低，防止冲刷已有知识
+    # =========================================================
+    # 6. VQA-RAD 训练超参数
+    # =========================================================
+    #重要，一定要根据卡数量调整，这回改变参数更新次数
+    ## 双卡：
+    # per_device_train_batch_size = 4
+    # gradient_accumulation_steps = 2
+    #四卡：
+    per_device_train_batch_size = 4
+    gradient_accumulation_steps = 1
+
+    #小数据集VQA-RAD改成10
+    num_train_epochs: float = 40.0
+
+    # =========================================================
+    # A6-DLR 分组学习率
+    # =========================================================
+    #使用"A6-DLR"模式时候为true
+    use_discriminative_lr: bool = True
+    #使用"A0"模式时候设置为False
+    # use_discriminative_lr: bool = False
+
+    lr_recipe_name: str = "DLR"
+
+    # # Stage 2 加载的 Stage 1 是否为 DLR 版本。
+    # stage1_use_discriminative_lr: bool = True
+    # Stage 2 加载的 Stage 1 是否不为 DLR 版本,这个设置为False。
+    stage1_use_discriminative_lr: bool = True
+
+    stage1_lr_recipe_name: str = "DLR"
+
+    # 旧统一学习率，同时作为 Trainer 基础/显示学习率。
+    learning_rate: float = 1e-5
+
+    # Stage 2 parameter-group learning rates
+    lora_learning_rate: float = 1e-5
+    visual_expert_learning_rate: float = 3e-5
+    router_gate_learning_rate: float = 2e-5
+    visual_norm_learning_rate: float = 1e-5
+
     weight_decay: float = 0.01
+
     lr_scheduler_type: str = "cosine"
-    warmup_steps: int = 50  # 相应缩短 warmup
+    warmup_steps: int = 50
     max_grad_norm: float = 1.0
+
     logging_steps: int = 10
-    save_steps: int = 200 # 每隔 200 步保存一次
-    save_total_limit: int = 500 #上限拉高，保存所有checkpoint
+    #小数据集VQA-RAD改成50
+    save_steps: int = 50
+    save_total_limit: int = 20
+
     gradient_checkpointing: bool = True
     dataloader_num_workers: int = 8
 
+    # =========================================================
+    # 7. RoMA-Net V2-lite
+    # 必须与 Stage 1 保持一致
+    # =========================================================
+    enable_visual_adapter: bool = True
+
+    visual_adapter_hidden_dim: int = 4096
+    visual_adapter_r: int = 16
+    router_hidden_dim: int = 128
+
+    scale_mode: str = "learned"
+    fixed_scale_weights: list[float] = field(
+        default_factory=lambda: [
+            1.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+        ]
+    )
+
+    gate_mode: str = "learned"
+    fixed_gate: float = 1.0
+    gate_init: float = 0.5
+
+    lambda_mode: str = "learnable"
+    fixed_lambda: float = 0.1
+    lambda_max: float = 1.0
+    lambda_init: float = 0.1
+
+    use_rms_norm: bool = True
+    residual_norm_eps: float = 1e-6
+    residual_norm_ratio_clip: Optional[float] = 10.0
+
     def __post_init__(self):
-        if self.attn_implementation == "flash_attention_2" and self.torch_dtype != "bfloat16":
-            print("⚠️ Warning: flash_attention_2 is best paired with bfloat16!")
+        if len(self.fixed_scale_weights) != 3:
+            raise ValueError(
+                "fixed_scale_weights 必须包含 3 个值，"
+                "依次对应 Conv2D F3/F5/F7。"
+            )
 
-        # 🚀 1. 根据 router_mode 提取基础路径 (千万不要在这里提前拼接 final_weights)
-        if self.router_mode == "dynamic":
-            base_output_dir = self.output_dir_with_visual_adapter_dynamic
-            base_stage1_dir = self.stage1_output_dir_with_visual_adapter_dynamic
-        elif self.router_mode == "fixed":
-            base_output_dir = self.output_dir_with_visual_adapter_fixed
-            base_stage1_dir = self.stage1_output_dir_with_visual_adapter_fixed
+        aid = self.ablation_id.upper()
+        self.ablation_id = aid
+
+        # -----------------------------------------------------
+        # 必须与 Stage 1 TrainConfig 的消融定义完全相同
+        # -----------------------------------------------------
+        if aid == "A0":
+            self.enable_visual_adapter = False
+            self.scale_mode = "learned"
+            self.gate_mode = "fixed"
+            self.fixed_gate = 1.0
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 0.0
+            self.use_rms_norm = False
+
+        elif aid == "A1":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "fixed"
+            self.fixed_gate = 1.0
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 0.1
+            self.use_rms_norm = True
+
+        elif aid == "A2":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "fixed"
+            self.fixed_gate = 1.0
+            self.lambda_mode = "learnable"
+            self.lambda_init = 0.1
+            self.lambda_max = 1.0
+            self.use_rms_norm = True
+
+        elif aid == "A3":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 0.1
+            self.use_rms_norm = True
+
+        elif aid == "A4":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
+            self.lambda_init = 0.1
+            self.lambda_max = 1.0
+            self.use_rms_norm = False
+
+        elif aid == "A5":
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
+            self.lambda_init = 0.1
+            self.lambda_max = 1.0
+            self.use_rms_norm = True
+
+        elif aid == "A6":
+            # -------------------------------------------------
+            # 强视觉残差注入实验。
+            #
+            # effective residual scale = fixed_lambda * gate
+            # Stage 1 初始约为：
+            # 1.0 * 0.5 = 0.5
+            #
+            # Stage 2 会继承 Stage 1 已训练的 Gate 参数，
+            # gate_init 主要用于保持结构与配置语义一致。
+            # -------------------------------------------------
+            self.enable_visual_adapter = True
+
+            # BioMedCLIP-conditioned F3/F5/F7 动态路由
+            self.scale_mode = "learned"
+
+            # 样本级 residual gate
+            self.gate_mode = "learned"
+            self.gate_init = 0.5
+
+            # 固定 lambda=1.0
+            self.lambda_mode = "fixed"
+            self.fixed_lambda = 1.0
+
+            # 保留 residual RMS normalization
+            self.use_rms_norm = True
+
         else:
-            raise ValueError(f"❌ 不支持的 router_mode: {self.router_mode}，只能是 'dynamic' 或 'fixed'")
+            raise ValueError(
+                f"不支持的 ablation_id：{aid}。"
+                "可选值为 A0、A1、A2、A3、A4、A5、A6。"
+            )
 
-        # 🚀 2. 给 Stage 2 的输出路径动态追加 Alpha 后缀
-        self.output_dir = f"{base_output_dir}_Alpha_{self.moe_alpha}"
+        # -----------------------------------------------------
+        # Stage 1 权重目录
+        # 必须与 Stage 1 TrainConfig 的命名规则完全一致。
+        # -----------------------------------------------------
+        if self.ablation_id == "A0":
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"A0_LoRAOnly_"
+                f"Seed-{self.stage1_seed}"
+            )
 
-        # 🚀 3. 给 Stage 1 的读取路径追加 Alpha 后缀，然后再在最末端拼接 "final_weights"
-        stage1_alpha_dir = f"{base_stage1_dir}_Alpha_{self.moe_alpha}"
-        self.stage1_weights_dir = os.path.join(stage1_alpha_dir, "final_weights")
+        elif self.ablation_id == "A6":
+            stage1_a6_label = (
+                f"A6-{self.stage1_lr_recipe_name}"
+                if self.stage1_use_discriminative_lr
+                else "A6"
+            )
 
-        # =========================================================
-        # 🖨️ 新增：打印最终生成的路径，方便终端核对
-        # =========================================================
-        print("\n" + "=" * 60)
-        print(f"⚙️ [Stage 2 Train Config] 初始化完成 | 模式: {self.router_mode.upper()} | Alpha: {self.moe_alpha}")
-        print(f"📂 读取 Stage 1 权重: {self.stage1_weights_dir}")
-        print(f"💾 训练结果输出目录: {self.output_dir}")
-        print("=" * 60 + "\n")
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage1_a6_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
+                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.stage1_seed}"
+            )
+
+        else:
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{self.ablation_id}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}_"
+                f"Lambda-{self.lambda_mode}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.stage1_seed}"
+            )
+
+        self.stage1_weights_dir = os.path.join(
+            self.output_root,
+            stage1_experiment_dir,
+            "final_weights",
+        )
+
+        # -----------------------------------------------------
+        # Stage 2 输出目录
+        # 将 Stage 1 数据来源和 Conv2D 结构都写进目录名，
+        # -----------------------------------------------------
+        if self.ablation_id == "A0":
+            stage2_experiment_dir = (
+                f"Stage2_VQA_RAD_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"A0_LoRAOnly_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
+        elif self.ablation_id == "A6":
+            stage2_a6_label = (
+                f"A6-{self.lr_recipe_name}"
+                if self.use_discriminative_lr
+                else "A6"
+            )
+
+            stage2_experiment_dir = (
+                f"Stage2_VQA_RAD_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage2_a6_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
+                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
+        else:
+            stage2_experiment_dir = (
+                f"Stage2_VQA_RAD_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{self.ablation_id}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-{self.scale_mode}_"
+                f"Gate-{self.gate_mode}_"
+                f"Lambda-{self.lambda_mode}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
+        self.output_dir = os.path.join(
+            self.output_root,
+            stage2_experiment_dir,
+        )
+
+        if self.enable_visual_adapter:
+            if self.lambda_mode == "fixed":
+                configured_lambda = self.fixed_lambda
+            else:
+                configured_lambda = self.lambda_init
+
+            configured_gate = (
+                self.gate_init
+                if self.gate_mode == "learned"
+                else self.fixed_gate
+            )
+
+            ddp_print(
+                "视觉残差配置："
+                f"lambda_mode={self.lambda_mode}, "
+                f"lambda={configured_lambda}, "
+                f"gate_mode={self.gate_mode}, "
+                f"gate_init={configured_gate}, "
+                f"初始lambda×gate={configured_lambda * configured_gate}"
+            )
+
+        if self.use_discriminative_lr:
+            ddp_print(
+                "Stage 2 分组学习率："
+                f"LoRA={self.lora_learning_rate:g}, "
+                f"Experts={self.visual_expert_learning_rate:g}, "
+                f"Router/Gate={self.router_gate_learning_rate:g}, "
+                f"Norm={self.visual_norm_learning_rate:g}"
+            )
+
+        ddp_print(f"Stage 1 权重目录：{self.stage1_weights_dir}")
+        ddp_print(f"Stage 2 输出目录：{self.output_dir}")
+        if self.enable_visual_adapter:
+            ddp_print(
+                "视觉专家结构：DWConv2D "
+                "F3=3x3, F5=5x5, F7=7x7"
+            )
+        else:
+            ddp_print(
+                "视觉专家结构：A0 LoRA-only，未启用 visual adapter"
+            )

@@ -1,108 +1,314 @@
+from typing import Any, Sequence
+
 import torch
 from PIL import Image
-from typing import Dict, Any, List, Tuple
 
-# 导入 VQA-RAD 专属的 Prompt 组装器
-from utils.data_tools.prompt_builder.vqa_rad_prompt_builder import build_vqa_rad_prompt
+from utils.data_tools.prompt_builder.vqa_rad_prompt_builder import (
+    build_vqa_rad_prompt,
+)
 
 
 class VQARADEvalCollator:
     """
-    VQA-RAD 专属的评估/推理 Collator (Eval Collator)。
+    VQA-RAD Stage 2 评测/推理 Collator。
 
-    与 Train Collator 的区别：
-    1. 不再生成 labels (不需要计算 loss)。
-    2. 只组装 User 的问题部分 (含图片)，加上 add_generation_prompt=True 让模型准备作答。
-    3. 同步返回 metadata_list (包含 Ground Truth 等)，方便评测脚本进行对账。
+    A0：
+        只构造 Qwen3-VL 推理输入。
+
+    A1～A6：
+        同时构造 Qwen3-VL 与 BioMedCLIP 输入。
+
+    返回：
+        batch_inputs:
+            Qwen3-VL 推理输入；
+            启用视觉 Adapter 时还包含：
+                biomed_image_tensors
+                biomed_text_tokens
+
+        metadata_list:
+            保留样本索引、问题、参考答案和问题类型，
+            供评测脚本解码、清洗和计算指标。
     """
 
-    # 🚀 补充 1：与 Train Collator 对齐，增加 biomed 工具和 router_mode 初始化
-    def __init__(self, processor, cfg, biomed_transform=None, biomed_tokenizer=None):
+    def __init__(
+        self,
+        processor: Any,
+        cfg: Any,
+        biomed_transform: Any = None,
+        biomed_tokenizer: Any = None,
+    ):
         self.processor = processor
-        self.cfg = cfg
 
-        self.router_mode = getattr(cfg, "router_mode", "fixed")
-        # 接收外部传来的预处理工具
-        self.biomed_img_transform = biomed_transform
-        self.biomed_tokenizer = biomed_tokenizer
+        self.max_size = int(
+            cfg.vqa_rad_max_size
+        )
 
-    def __call__(self, batch: List[Dict[str, Any]]) -> Tuple[Dict[str, torch.Tensor], List[Dict[str, Any]]]:
-        texts = []
-        images = []
-        metadata_list = []
+        self.instruction_suffix = (
+            cfg.vqa_rad_instruction_suffix
+        )
 
-        # 🎯 补充 2：用于收集 BioMedCLIP 专属的张量
-        biomed_imgs = []
-        biomed_txts = []
+        self.enable_visual_adapter = bool(
+            cfg.enable_visual_adapter
+        )
 
-        for sample in batch:
-            # 1. 组装提问文本 (拼接 Instruction Suffix)
-            question_text = build_vqa_rad_prompt(
-                question=sample['question'],
-                instruction_suffix=self.cfg.vqa_rad_instruction_suffix
+        # 自回归批量生成必须使用左 padding。
+        if self.processor.tokenizer.padding_side != "left":
+            raise ValueError(
+                "VQARADEvalCollator 要求 "
+                "processor.tokenizer.padding_side='left'。"
             )
 
-            # 2. 构造仅包含 User 提问的消息模板
+        self.biomed_img_transform = (
+            biomed_transform
+        )
+        self.biomed_tokenizer = (
+            biomed_tokenizer
+        )
+
+        # A1～A6 必须提供 BioMedCLIP 工具。
+        # A0 可以全部为 None。
+        if self.enable_visual_adapter:
+            if self.biomed_img_transform is None:
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_transform。"
+                )
+
+            if self.biomed_tokenizer is None:
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_tokenizer。"
+                )
+
+    @staticmethod
+    def _load_rgb_image(
+        image_path: str,
+    ) -> Image.Image:
+        """
+        读取图像并转换为独立的 RGB PIL Image。
+
+        使用 convert 后返回副本，避免离开 with 块后
+        原图文件句柄关闭导致延迟读取失败。
+        """
+        try:
+            with Image.open(image_path) as image:
+                return image.convert("RGB")
+        except Exception as exc:
+            raise RuntimeError(
+                f"读取 VQA-RAD 图像失败：{image_path}"
+            ) from exc
+
+    def _resize_for_qwen(
+        self,
+        image: Image.Image,
+    ) -> Image.Image:
+        """
+        仅限制最长边，不放大原图，并保持宽高比例。
+        """
+        width, height = image.size
+        longest_edge = max(width, height)
+
+        if longest_edge <= self.max_size:
+            return image
+
+        scale = self.max_size / longest_edge
+
+        new_width = max(
+            1,
+            round(width * scale),
+        )
+        new_height = max(
+            1,
+            round(height * scale),
+        )
+
+        # 同时兼容新旧 Pillow。
+        bicubic = getattr(
+            Image,
+            "Resampling",
+            Image,
+        ).BICUBIC
+
+        return image.resize(
+            (new_width, new_height),
+            resample=bicubic,
+        )
+
+    def __call__(
+        self,
+        batch: Sequence[dict[str, Any]],
+    ):
+        if not batch:
+            raise ValueError(
+                "VQARADEvalCollator 收到了空 batch。"
+            )
+
+        # Qwen3-VL 输入。
+        prompt_texts: list[str] = []
+        qwen_images: list[Image.Image] = []
+
+        # 评测信息，不送入模型。
+        metadata_list: list[dict[str, Any]] = []
+
+        # A1～A6 的 BioMedCLIP 输入。
+        biomed_images: list[torch.Tensor] = []
+        biomed_questions: list[str] = []
+
+        for sample in batch:
+            image_path = sample["image_path"]
+
+            raw_question = str(
+                sample["question"]
+            ).strip()
+
+            if not raw_question:
+                raise ValueError(
+                    f"发现空问题，图像路径：{image_path}"
+                )
+
+            # Qwen 使用附带回答格式要求的完整问题。
+            qwen_question = build_vqa_rad_prompt(
+                question=raw_question,
+                instruction_suffix=(
+                    self.instruction_suffix
+                ),
+            )
+
             messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": sample["image_path"]},
-                        {"type": "text", "text": question_text},
+                        {
+                            "type": "image",
+                            "image": image_path,
+                        },
+                        {
+                            "type": "text",
+                            "text": qwen_question,
+                        },
                     ],
                 }
             ]
 
-            # 加上生成引导符 (比如 `<|im_start|>assistant\n`)，准备让模型接话
-            text_prompt = self.processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+            # 加入 assistant generation prefix，
+            # 让 generate() 从 assistant 回答位置继续生成。
+            prompt_text = (
+                self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
             )
-            texts.append(text_prompt)
 
-            # 3. 图像读取与自适应缩放
-            with Image.open(sample["image_path"]) as pil_img:
-                img = pil_img.convert("RGB")
+            original_image = self._load_rgb_image(
+                image_path
+            )
 
-            # =======================================================
-            # 🧠 补充 3：在此处截获原始图片和文本，转化为 BioMed 特征
-            # =======================================================
-            if self.router_mode == "dynamic":
-                biomed_imgs.append(self.biomed_img_transform(img))
-                # 提取纯问题文本给医疗大脑作为路由依据
-                biomed_txts.append(self.biomed_tokenizer([question_text])[0])
+            if self.enable_visual_adapter:
+                # BioMedCLIP 必须接收原始 RGB 图像，
+                # 不接收经过 Qwen max_size 缩放后的图像。
+                biomed_image = (
+                    self.biomed_img_transform(
+                        original_image
+                    )
+                )
 
-            w, h = img.size
-            scale = min(self.cfg.vqa_rad_max_size / max(w, h), 1.0)
-            if scale < 1.0:
-                new_w, new_h = int(w * scale), int(h * scale)
-                img = img.resize((new_w, new_h), Image.BICUBIC)
-            images.append(img)
+                if not isinstance(
+                    biomed_image,
+                    torch.Tensor,
+                ):
+                    raise TypeError(
+                        "biomed_transform 应返回 Tensor，"
+                        f"当前类型为 "
+                        f"{type(biomed_image)}。"
+                    )
 
-            # 4. 组装评估必需的 Metadata (把正确答案、原始题目带到外部去打分)
-            metadata_list.append({
-                "index": sample["index"],
-                "image_path": sample["image_path"],
-                "question": sample["question"],
-                "gt_answer": sample["answer"],
-                "question_type": sample.get("question_type", "UNKNOWN"),
-                "answer_type": sample.get("answer_type", "UNKNOWN"),
-            })
+                biomed_images.append(
+                    biomed_image
+                )
 
-        # 5. 批处理张量化
+                # Router 只使用原始医学问题，
+                # 不加入 instruction suffix。
+                biomed_questions.append(
+                    raw_question
+                )
+
+            qwen_image = self._resize_for_qwen(
+                original_image
+            )
+
+            prompt_texts.append(prompt_text)
+            qwen_images.append(qwen_image)
+
+            metadata_list.append(
+                {
+                    "index": sample.get("index"),
+                    "image_path": image_path,
+                    "question": raw_question,
+                    "gt_answer": sample.get(
+                        "answer",
+                        "",
+                    ),
+                    "question_type": sample.get(
+                        "question_type",
+                        "UNKNOWN",
+                    ),
+                    "answer_type": sample.get(
+                        "answer_type",
+                        "UNKNOWN",
+                    ),
+                }
+            )
+
+        # 整个 batch 一次性处理 Qwen3-VL 输入。
         batch_inputs = self.processor(
-            text=texts,
-            images=images,
+            text=prompt_texts,
+            images=qwen_images,
             return_tensors="pt",
             padding=True,
         )
 
-        # =======================================================
-        # 🧠 补充 4：将 BioMed 特征打包塞入字典，供 Wrapper 劫持提取
-        # =======================================================
-        if self.router_mode == "dynamic":
-            batch_inputs["biomed_image_tensors"] = torch.stack(biomed_imgs)  # shape: [Batch, 3, 224, 224]
-            batch_inputs["biomed_text_tokens"] = torch.stack(biomed_txts)  # shape: [Batch, Context_Len]
+        if self.enable_visual_adapter:
+            batch_inputs["biomed_image_tensors"] = (
+                torch.stack(
+                    biomed_images,
+                    dim=0,
+                )
+            )
+
+            # 整个 batch 一次性进行 BioMedCLIP tokenize，
+            # 不再循环中逐条 tokenizer。
+            biomed_text_tokens = (
+                self.biomed_tokenizer(
+                    biomed_questions
+                )
+            )
+
+            if not isinstance(
+                biomed_text_tokens,
+                torch.Tensor,
+            ):
+                raise TypeError(
+                    "biomed_tokenizer 应返回 Tensor，"
+                    f"当前类型为 "
+                    f"{type(biomed_text_tokens)}。"
+                )
+
+            if (
+                biomed_text_tokens.ndim != 2
+                or biomed_text_tokens.shape[0]
+                != len(batch)
+            ):
+                raise ValueError(
+                    "BioMedCLIP 文本 token 形状错误："
+                    f"{tuple(biomed_text_tokens.shape)}，"
+                    f"期望 batch size={len(batch)}。"
+                )
+
+            batch_inputs["biomed_text_tokens"] = (
+                biomed_text_tokens
+                .detach()
+                .cpu()
+            )
 
         return batch_inputs, metadata_list
