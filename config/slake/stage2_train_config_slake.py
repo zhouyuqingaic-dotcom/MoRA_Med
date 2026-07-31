@@ -222,6 +222,9 @@ class Stage2TrainConfig:
             self.fixed_lambda = 0.0
             self.use_rms_norm = False
 
+            self.use_discriminative_lr = False
+            self.stage1_use_discriminative_lr = False
+
         elif aid == "A1":
             self.enable_visual_adapter = True
             self.scale_mode = "learned"
@@ -230,6 +233,10 @@ class Stage2TrainConfig:
             self.lambda_mode = "fixed"
             self.fixed_lambda = 0.1
             self.use_rms_norm = True
+
+
+            self.use_discriminative_lr = False
+            self.stage1_use_discriminative_lr = False
 
         elif aid == "A2":
             self.enable_visual_adapter = True
@@ -241,6 +248,9 @@ class Stage2TrainConfig:
             self.lambda_max = 1.0
             self.use_rms_norm = True
 
+            self.use_discriminative_lr = False
+            self.stage1_use_discriminative_lr = False
+
         elif aid == "A3":
             self.enable_visual_adapter = True
             self.scale_mode = "learned"
@@ -248,6 +258,9 @@ class Stage2TrainConfig:
             self.lambda_mode = "fixed"
             self.fixed_lambda = 0.1
             self.use_rms_norm = True
+
+            self.use_discriminative_lr = False
+            self.stage1_use_discriminative_lr = False
 
         elif aid == "A4":
             self.enable_visual_adapter = True
@@ -258,6 +271,9 @@ class Stage2TrainConfig:
             self.lambda_max = 1.0
             self.use_rms_norm = False
 
+            self.use_discriminative_lr = False
+            self.stage1_use_discriminative_lr = False
+
         elif aid == "A5":
             self.enable_visual_adapter = True
             self.scale_mode = "learned"
@@ -266,6 +282,9 @@ class Stage2TrainConfig:
             self.lambda_init = 0.1
             self.lambda_max = 1.0
             self.use_rms_norm = True
+
+            self.use_discriminative_lr = False
+            self.stage1_use_discriminative_lr = False
 
         elif aid == "A6":
             # -------------------------------------------------

@@ -565,6 +565,12 @@ def main():
         remove_unused_columns=False,
         ddp_find_unused_parameters=False,
         report_to="none",
+        
+        # 控制 Trainer 内部训练随机状态
+        seed=cfg.seed,
+
+        # 显式控制数据 sampler；和 seed 相同时属于推荐但非必需
+        data_seed=cfg.seed,
     )
 
     trainer_kwargs = {}
