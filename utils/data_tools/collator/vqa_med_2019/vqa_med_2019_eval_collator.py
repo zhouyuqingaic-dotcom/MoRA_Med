@@ -1,142 +1,265 @@
+from typing import Any, Sequence
+
 import torch
 from PIL import Image
-from typing import Dict, Any, List, Tuple
 
-from utils.data_tools.prompt_builder.vqa_med_2019_prompt_builder import build_vqa_med_2019_prompt
+from utils.data_tools.prompt_builder.vqa_med_2019_prompt_builder import (
+    build_vqa_med_2019_prompt,
+)
 
 
 class VQAMED2019EvalCollator:
     """
-    VQA-MED-2019 专属的评估/推理 Collator (Eval Collator)。
+    VQA-Med 2019 Stage 2 评测 Collator。
 
-    修复点：
-    1. 保留 28 像素对齐逻辑，降低 Qwen3-VL RoPE / grid 越界风险。
-    2. 使用 processor 的 max_pixels 继续约束视觉 token 数。
-    3. DYNAMIC 模式下正确注入 BioMedCLIP 图像与文本张量。
-    4. 将 padding=False 改为 padding=True，避免 batch_size > 1 时
-       text / image token / image_grid_thw 对齐不稳定。
-    5. 增加输入合法性检查，提前暴露 BioMedCLIP transform/tokenizer 缺失问题。
+    A0：
+        只构造 Qwen3-VL 输入。
+
+    A1～A6：
+        同时构造 Qwen3-VL 与 BioMedCLIP 输入。
     """
 
-    def __init__(self, processor, cfg, biomed_transform=None, biomed_tokenizer=None):
+    def __init__(
+        self,
+        processor: Any,
+        cfg: Any,
+        biomed_transform: Any = None,
+        biomed_tokenizer: Any = None,
+    ):
         self.processor = processor
-        self.cfg = cfg
+        self.max_size = int(
+            cfg.vqa_med_2019_max_size
+        )
+        self.instruction_suffix = (
+            cfg.vqa_med_2019_instruction_suffix
+        )
+        self.enable_visual_adapter = bool(
+            cfg.enable_visual_adapter
+        )
 
-        self.router_mode = getattr(cfg, "router_mode", "fixed")
+        if self.processor.tokenizer.padding_side != "left":
+            raise ValueError(
+                "VQAMED2019EvalCollator 要求 "
+                "processor.tokenizer.padding_side='left'。"
+            )
+
         self.biomed_img_transform = biomed_transform
         self.biomed_tokenizer = biomed_tokenizer
 
-        if self.router_mode == "dynamic":
+        if self.enable_visual_adapter:
             if self.biomed_img_transform is None:
-                raise ValueError("router_mode='dynamic' 时必须传入 biomed_transform")
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_transform。"
+                )
+
             if self.biomed_tokenizer is None:
-                raise ValueError("router_mode='dynamic' 时必须传入 biomed_tokenizer")
+                raise ValueError(
+                    "enable_visual_adapter=True，"
+                    "但没有传入 biomed_tokenizer。"
+                )
 
-    def _resize_to_qwen_grid(self, img: Image.Image) -> Image.Image:
-        """
-        将图像按最长边缩放，并强制宽高对齐到 28 的倍数。
+    @staticmethod
+    def _load_rgb_image(
+        image_path: str,
+    ) -> Image.Image:
+        try:
+            with Image.open(image_path) as image:
+                return image.convert("RGB")
+        except Exception as exc:
+            raise RuntimeError(
+                "读取 VQA-Med 2019 图像失败："
+                f"{image_path}"
+            ) from exc
 
-        Qwen-VL 系列视觉分支通常依赖 patch / merge 后的 grid。
-        宽高不稳定或过大时，容易在 RoPE / gather 阶段触发 CUDA index out of bounds。
-        """
-        w, h = img.size
-        max_size = int(getattr(self.cfg, "vqa_med_2019_max_size", 672))
+    def _resize_for_qwen(
+        self,
+        image: Image.Image,
+    ) -> Image.Image:
+        width, height = image.size
+        longest_edge = max(width, height)
 
-        scale = min(max_size / max(w, h), 1.0)
-        new_w, new_h = int(w * scale), int(h * scale)
+        if longest_edge <= self.max_size:
+            return image
 
-        # 强制对齐到 28 的倍数；至少保留 28，避免极端小图变成 0。
-        new_w = max(28, (new_w // 28) * 28)
-        new_h = max(28, (new_h // 28) * 28)
+        scale = self.max_size / longest_edge
 
-        # 如果原图本身已经符合尺寸，也仍然 resize 到对齐后的尺寸，保证 processor 输入稳定。
-        return img.resize((new_w, new_h), Image.BICUBIC)
+        new_width = max(
+            1,
+            round(width * scale),
+        )
+        new_height = max(
+            1,
+            round(height * scale),
+        )
 
-    def __call__(self, batch: List[Dict[str, Any]]) -> Tuple[Dict[str, torch.Tensor], List[Dict[str, Any]]]:
-        texts: List[str] = []
-        images: List[Image.Image] = []
-        metadata_list: List[Dict[str, Any]] = []
+        bicubic = getattr(
+            Image,
+            "Resampling",
+            Image,
+        ).BICUBIC
 
-        biomed_imgs: List[torch.Tensor] = []
-        biomed_txts: List[torch.Tensor] = []
+        return image.resize(
+            (new_width, new_height),
+            resample=bicubic,
+        )
 
-        for sample in batch:
-            # 1. 组装提问文本
-            question_text = build_vqa_med_2019_prompt(
-                question=sample["question"],
-                instruction_suffix=self.cfg.vqa_med_2019_instruction_suffix,
+    def __call__(
+        self,
+        batch: Sequence[dict[str, Any]],
+    ):
+        if not batch:
+            raise ValueError(
+                "VQAMED2019EvalCollator 收到了空 batch。"
             )
 
-            # 2. 构造仅包含 User 提问的消息模板
+        prompt_texts: list[str] = []
+        qwen_images: list[Image.Image] = []
+        metadata_list: list[dict[str, Any]] = []
+
+        biomed_images: list[torch.Tensor] = []
+        biomed_questions: list[str] = []
+
+        for sample in batch:
+            image_path = sample["image_path"]
+
+            raw_question = str(
+                sample["question"]
+            ).strip()
+
+            if not raw_question:
+                raise ValueError(
+                    f"发现空问题，图像路径：{image_path}"
+                )
+
+            # Qwen 使用附带回答要求的完整问题。
+            qwen_question = build_vqa_med_2019_prompt(
+                question=raw_question,
+                instruction_suffix=self.instruction_suffix,
+            )
+
             messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": sample["image_path"]},
-                        {"type": "text", "text": question_text},
+                        {
+                            "type": "image",
+                            "image": image_path,
+                        },
+                        {
+                            "type": "text",
+                            "text": qwen_question,
+                        },
                     ],
                 }
             ]
 
-            text_prompt = self.processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+            prompt_text = (
+                self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
             )
-            texts.append(text_prompt)
 
-            # 3. 图像读取、RGB 转换、物理缩放、28 像素对齐
-            with Image.open(sample["image_path"]) as pil_img:
-                img = pil_img.convert("RGB")
+            original_image = self._load_rgb_image(
+                image_path
+            )
 
-            img = self._resize_to_qwen_grid(img)
-            images.append(img)
+            if self.enable_visual_adapter:
+                biomed_image = self.biomed_img_transform(
+                    original_image
+                )
 
-            # 4. DYNAMIC 路由模式下，为 Stage 2 MoE 注入 BioMedCLIP 输入
-            if self.router_mode == "dynamic":
-                biomed_img = self.biomed_img_transform(img)
-                biomed_txt = self.biomed_tokenizer([question_text])[0]
+                if not isinstance(
+                    biomed_image,
+                    torch.Tensor,
+                ):
+                    raise TypeError(
+                        "biomed_transform 应返回 Tensor，"
+                        f"当前类型为 {type(biomed_image)}。"
+                    )
 
-                if not isinstance(biomed_img, torch.Tensor):
-                    raise TypeError(f"biomed_img_transform 必须返回 torch.Tensor，实际得到: {type(biomed_img)}")
-                if not isinstance(biomed_txt, torch.Tensor):
-                    raise TypeError(f"biomed_tokenizer 必须返回 torch.Tensor，实际得到: {type(biomed_txt)}")
+                biomed_images.append(
+                    biomed_image
+                )
 
-                biomed_imgs.append(biomed_img)
-                biomed_txts.append(biomed_txt)
+                # 与 Stage 2 训练一致：
+                # Router 使用原始医学问题，不附加回答格式指令。
+                biomed_questions.append(
+                    raw_question
+                )
 
-            # 5. 组装评估必需的 metadata
+            qwen_image = self._resize_for_qwen(
+                original_image
+            )
+
+            prompt_texts.append(prompt_text)
+            qwen_images.append(qwen_image)
+
             metadata_list.append(
                 {
-                    "index": sample["index"],
-                    "image_path": sample["image_path"],
-                    "question": sample["question"],
-                    "gt_answer": sample["answer"],
-                    "question_type": sample.get("question_type", "UNKNOWN"),
-                    "answer_type": sample.get("answer_type", "UNKNOWN"),
+                    "index": sample.get("index"),
+                    "image_path": image_path,
+                    "question": raw_question,
+                    "gt_answer": sample.get(
+                        "answer",
+                        "",
+                    ),
+                    "question_type": sample.get(
+                        "question_type",
+                        "UNKNOWN",
+                    ),
+                    "answer_type": sample.get(
+                        "answer_type",
+                        "UNKNOWN",
+                    ),
                 }
             )
 
-        # 6. 批处理张量化
-        #
-        # 关键修复：
-        # 原来 padding=False 在 batch_size > 1 时容易让 Qwen3-VL 的 image token、
-        # image_grid_thw、pixel_values 对齐不稳定。
-        #
-        # 这里改成 padding=True。即使 batch_size=1，也不会伤害结果；
-        # 如果之后 batch_size 改回 4，也更安全。
-        max_size = int(getattr(self.cfg, "vqa_med_2019_max_size", 672))
         batch_inputs = self.processor(
-            text=texts,
-            images=images,
+            text=prompt_texts,
+            images=qwen_images,
             return_tensors="pt",
             padding=True,
-            max_pixels=int(max_size ** 2),
         )
 
-        # 7. 注入 BioMedCLIP 特征张量
-        if self.router_mode == "dynamic":
-            batch_inputs["biomed_image_tensors"] = torch.stack(biomed_imgs, dim=0)
-            batch_inputs["biomed_text_tokens"] = torch.stack(biomed_txts, dim=0)
+        if self.enable_visual_adapter:
+            batch_inputs["biomed_image_tensors"] = (
+                torch.stack(
+                    biomed_images,
+                    dim=0,
+                )
+            )
+
+            biomed_text_tokens = self.biomed_tokenizer(
+                biomed_questions
+            )
+
+            if not isinstance(
+                biomed_text_tokens,
+                torch.Tensor,
+            ):
+                raise TypeError(
+                    "biomed_tokenizer 应返回 Tensor，"
+                    f"当前类型为 "
+                    f"{type(biomed_text_tokens)}。"
+                )
+
+            if (
+                biomed_text_tokens.ndim != 2
+                or biomed_text_tokens.shape[0]
+                != len(batch)
+            ):
+                raise ValueError(
+                    "BioMedCLIP 文本 token 形状错误："
+                    f"{tuple(biomed_text_tokens.shape)}"
+                )
+
+            batch_inputs["biomed_text_tokens"] = (
+                biomed_text_tokens
+                .detach()
+                .cpu()
+            )
 
         return batch_inputs, metadata_list
