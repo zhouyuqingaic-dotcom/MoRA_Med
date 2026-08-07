@@ -271,7 +271,8 @@ def main():
     )
 
     train_dataset = ConcatDataset(
-        [train_subset, val_subset]
+        # [train_subset, val_subset]
+        [train_subset]
     )
 
     ddp_print(

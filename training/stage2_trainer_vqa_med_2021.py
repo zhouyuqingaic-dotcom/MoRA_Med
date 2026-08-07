@@ -56,25 +56,6 @@ from utils.training.discriminative_optimizer import (
 )
 
 
-# ============================================================
-# 训练数据模式
-# ============================================================
-#
-# True:
-#   与 SLAKE、VQA-Med 2019 当前 Trainer 一样，
-#   使用 Train + Validation 共同训练。
-#
-# False:
-#   只使用 Train 训练。
-#
-# Test 永远不会加入训练。
-#
-# 这个开关只允许放在 Trainer，不进入任何 Config：
-# Config 负责路径和超参数，Trainer 直接决定训练集怎样拼接。
-#
-TRAIN_WITH_VALIDATION: bool = True
-
-
 def maybe_limit_dataset(
     dataset: Dataset,
     max_samples,
@@ -329,26 +310,32 @@ def build_train_dataset(
     cfg: Stage2TrainConfig,
 ):
     """
-    根据 TRAIN_WITH_VALIDATION 构造最终训练集。
+    构造 VQA-Med 2021 Stage 2 训练集。
 
-    False:
-        Train
-        -> 可选 Smoke Test 截取
-        -> 无效监督过滤
-        -> Trainer
+    与当前 stage2_trainer_slake.py 和
+    stage2_trainer_vqa_med_2019.py 保持相同风格：
 
-    True:
-        Train / Validation
-        -> 各自可选 Smoke Test 截取
-        -> 各自无效监督过滤
-        -> ConcatDataset
-        -> Trainer
+    1. 分别加载 Train 与 Validation；
+    2. 分别执行可选 Smoke Test 截取；
+    3. 在 ConcatDataset / DDP DataLoader 前过滤无效监督；
+    4. 直接通过 ConcatDataset 中的列表决定如何组合。
+
+    当前默认：
+        只使用 Train。
+
+    切换为 Train + Validation 时，把：
+
+        [train_subset]
+
+    改成：
+
+        [train_subset, val_subset]
 
     Test 永远不会在这里读取。
     """
-    # --------------------------------------------------------
+    # ========================================================
     # 1. Train
-    # --------------------------------------------------------
+    # ========================================================
     train_subset = VQAMED2021Dataset(
         jsonl_path=(
             cfg.vqa_med_2021_train_jsonl_path
@@ -374,31 +361,9 @@ def build_train_dataset(
         print_rank=cfg.print_rank,
     )
 
-    # 与 SLAKE / VQA-Med 2019 一样：
-    # 在构造 ConcatDataset 和 DDP DataLoader 前过滤。
-    train_subset = (
-        filter_invalid_vqa_med_2021_samples(
-            dataset=train_subset,
-            split_name="train",
-            print_rank=cfg.print_rank,
-        )
-    )
-
-    # --------------------------------------------------------
-    # 2. 纯 Train
-    # --------------------------------------------------------
-    if not TRAIN_WITH_VALIDATION:
-        ddp_print(
-            "✅ 当前训练模式：VQA-Med 2021 Train-only，"
-            f"共有 {len(train_subset)} 条有效医学样本。",
-            print_rank=cfg.print_rank,
-        )
-
-        return train_subset
-
-    # --------------------------------------------------------
-    # 3. Validation
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. Validation
+    # ========================================================
     val_subset = VQAMED2021Dataset(
         jsonl_path=(
             cfg.vqa_med_2021_validation_jsonl_path
@@ -424,6 +389,17 @@ def build_train_dataset(
         print_rank=cfg.print_rank,
     )
 
+    # ========================================================
+    # 3. 在 ConcatDataset 和 DDP DataLoader 前过滤
+    # ========================================================
+    train_subset = (
+        filter_invalid_vqa_med_2021_samples(
+            dataset=train_subset,
+            split_name="train",
+            print_rank=cfg.print_rank,
+        )
+    )
+
     val_subset = (
         filter_invalid_vqa_med_2021_samples(
             dataset=val_subset,
@@ -432,26 +408,26 @@ def build_train_dataset(
         )
     )
 
-    # --------------------------------------------------------
-    # 4. Train + Validation
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. 在这里直接决定训练集组合
+    # ========================================================
     train_dataset = ConcatDataset(
-        [
-            train_subset,
-            val_subset,
-        ]
+        # Train + Validation：
+        # [train_subset, val_subset]
+
+        # Train-only：
+        [train_subset]
     )
 
     ddp_print(
-        "✅ 当前训练模式：VQA-Med 2021 Train + Validation，"
+        "✅ VQA-Med 2021 数据集清理与组合完成："
         f"Train={len(train_subset)}，"
         f"Validation={len(val_subset)}，"
-        f"合计={len(train_dataset)} 条有效医学样本。",
+        f"实际参与训练={len(train_dataset)} 条。",
         print_rank=cfg.print_rank,
     )
 
     return train_dataset
-
 
 def main():
     # ==========================================
@@ -487,11 +463,6 @@ def main():
         "🚀 [1/6] 启动 MoRA Stage 2 "
         "VQA-Med 2021 训练！"
         f"当前消融: {cfg.ablation_id}",
-        print_rank=cfg.print_rank,
-    )
-    ddp_print(
-        f"    TRAIN_WITH_VALIDATION="
-        f"{TRAIN_WITH_VALIDATION}",
         print_rank=cfg.print_rank,
     )
     ddp_print(
@@ -533,7 +504,7 @@ def main():
             )
 
     # ==========================================
-    # 1. 加载 Train，按开关决定是否拼接 Validation
+    # 1. 加载 Train / Validation，并按 ConcatDataset 列表组合
     # ==========================================
     ddp_print(
         "⏳ [2/6] 正在构造 "

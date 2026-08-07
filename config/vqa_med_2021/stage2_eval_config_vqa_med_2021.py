@@ -21,9 +21,9 @@ class Stage2EvalConfig(Stage2TrainConfig):
     - 所有节点直接在 test.jsonl 上评测并生成排行榜。
 
     注意：
-    Train 与 Validation 是否拼接只在
+    Train 与 Validation 如何组合，只在
     training/stage2_trainer_vqa_med_2021.py 的
-    TRAIN_WITH_VALIDATION 中设置，与本评测配置无关。
+    ConcatDataset 列表中设置，与本评测配置无关。
     """
 
     # =========================================================
