@@ -199,7 +199,7 @@ def evaluate_checkpoint(
 
     # 每个 checkpoint 拥有独立输出目录。
     output_dir = os.path.join(
-        cfg.output_dir,
+        cfg.test_output_dir,
         name,
     )
     os.makedirs(
@@ -588,6 +588,9 @@ def evaluate_checkpoint(
 
     result = {
         "checkpoint": name,
+        "checkpoint_path": os.path.abspath(
+            weights_path
+        ),
         "closed_acc": (
             closed_correct / len(closed)
         ),
@@ -827,23 +830,39 @@ def evaluate_checkpoint(
 
 
 def get_checkpoints(cfg):
-    """
-    根据配置返回需要评测的权重目录。
+    if (
+        cfg.test_checkpoint_mode
+        == "best_validation"
+    ):
+        if not os.path.isfile(
+            cfg.best_checkpoint_path
+        ):
+            raise FileNotFoundError(
+                "找不到 Validation 最佳节点记录："
+                f"{cfg.best_checkpoint_path}\n"
+                "请先运行对应的 "
+                "stage2_validate_checkpoints_*.py。"
+            )
 
-    eval_final_weights_only=True：
-        只返回 final_weights。
+        with open(
+            cfg.best_checkpoint_path,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            best = json.load(file)
 
-    eval_final_weights_only=False：
-        按 step 顺序返回 checkpoint-*，
-        最后追加 final_weights。
-    """
+        checkpoint_path = (
+            best["selected_checkpoint_path"]
+        )
+
+        return [
+            checkpoint_path
+        ]
+
     final_weights = os.path.join(
         cfg.stage2_run_dir,
         "final_weights",
     )
-
-    if cfg.eval_final_weights_only:
-        return [final_weights]
 
     checkpoints = glob.glob(
         os.path.join(
@@ -854,10 +873,7 @@ def get_checkpoints(cfg):
 
     checkpoints.sort(
         key=lambda path: int(
-            path.rsplit(
-                "-",
-                1,
-            )[-1]
+            path.rsplit("-", 1)[-1]
         )
     )
 
@@ -867,13 +883,12 @@ def get_checkpoints(cfg):
 
     return checkpoints
 
-
 def main():
     cfg = Stage2EvalConfig()
 
-    # 创建当前实验统一评测目录。
+    # 创建 Test 输出目录。
     os.makedirs(
-        cfg.output_dir,
+        cfg.test_output_dir,
         exist_ok=True,
     )
 
@@ -1009,9 +1024,9 @@ def main():
         for path in checkpoints
     ]
 
-    # 保存所有 checkpoint 的汇总排行榜。
+    # 保存本次 Test 的汇总排行榜。
     leaderboard_path = os.path.join(
-        cfg.output_dir,
+        cfg.test_output_dir,
         "leaderboard.json",
     )
 
@@ -1058,23 +1073,14 @@ def main():
             f"| {result['overall_strict_acc']:.2%} |"
         )
 
-    best = max(
-        results,
-        key=lambda item: (
-            item["overall_strict_acc"]
-        ),
+    print(
+        f"\nTest checkpoint mode："
+        f"{cfg.test_checkpoint_mode}"
     )
 
     print(
-        f"\n最佳节点："
-        f"{best['checkpoint']} "
-        f"(Overall: "
-        f"{best['overall_strict_acc']:.2%})"
-    )
-
-    print(
-        f"评测输出目录："
-        f"{cfg.output_dir}"
+        f"Test 输出目录："
+        f"{cfg.test_output_dir}"
     )
 
     print(

@@ -260,7 +260,7 @@ def evaluate_checkpoint(
     loader,
     processor,
     cfg,
-    test_loader,
+    val_loader,
     llm_client,
     llm_cfg,
     biomed_extractor,
@@ -269,7 +269,7 @@ def evaluate_checkpoint(
     完成单个 checkpoint 的完整评测：
 
     1. 重建并加载模型；
-    2. 在 VQA-Med 2021 test 上本地生成答案；
+    2. 在 VQA-Med 2021 validation 上本地生成答案；
     3. 记录每条样本的 Router / Gate / Lambda；
     4. 对开放题未严格匹配样本执行 LLM Judge；
     5. 计算 Closed / Open / Overall Accuracy；
@@ -279,7 +279,7 @@ def evaluate_checkpoint(
 
     # 每个 checkpoint 拥有独立输出目录。
     output_dir = os.path.join(
-        cfg.test_output_dir,
+        cfg.validation_output_dir,
         name,
     )
     os.makedirs(
@@ -332,7 +332,7 @@ def evaluate_checkpoint(
     # =========================================================
     with torch.no_grad():
         for batch_inputs, metadata in tqdm(
-            test_loader,
+            val_loader,
             desc="Local Inference",
         ):
             # 将 Tensor 输入移动到模型所在设备。
@@ -931,35 +931,6 @@ def evaluate_checkpoint(
 
 
 def get_checkpoints(cfg):
-    if (
-        cfg.test_checkpoint_mode
-        == "best_validation"
-    ):
-        if not os.path.isfile(
-            cfg.best_checkpoint_path
-        ):
-            raise FileNotFoundError(
-                "找不到 Validation 最佳节点记录："
-                f"{cfg.best_checkpoint_path}\n"
-                "请先运行对应的 "
-                "stage2_validate_checkpoints_*.py。"
-            )
-
-        with open(
-            cfg.best_checkpoint_path,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            best = json.load(file)
-
-        checkpoint_path = (
-            best["selected_checkpoint_path"]
-        )
-
-        return [
-            checkpoint_path
-        ]
-
     final_weights = os.path.join(
         cfg.stage2_run_dir,
         "final_weights",
@@ -984,12 +955,13 @@ def get_checkpoints(cfg):
 
     return checkpoints
 
+
 def main():
     cfg = Stage2EvalConfig()
 
-    # 创建 Test 输出目录。
+    # 创建当前实验统一评测目录。
     os.makedirs(
-        cfg.test_output_dir,
+        cfg.validation_output_dir,
         exist_ok=True,
     )
 
@@ -1058,15 +1030,15 @@ def main():
         )
 
     # =========================================================
-    # 3. VQA-Med 2021 Test DataLoader
+    # 3. VQA-Med 2021 Validation DataLoader
     # =========================================================
     dataset = VQAMED2021Dataset(
         jsonl_path=(
-            cfg.vqa_med_2021_test_jsonl_path
+            cfg.vqa_med_2021_validation_jsonl_path
         ),
-        expected_split="test",
+        expected_split="validation",
         expected_count=(
-            cfg.vqa_med_2021_test_expected_count
+            cfg.vqa_med_2021_validation_expected_count
         ),
         verify_images=(
             cfg.vqa_med_2021_verify_images
@@ -1087,7 +1059,7 @@ def main():
         ),
     )
 
-    test_loader = DataLoader(
+    val_loader = DataLoader(
         dataset,
         batch_size=(
             cfg.per_device_eval_batch_size
@@ -1124,7 +1096,7 @@ def main():
             loader,
             processor,
             cfg,
-            test_loader,
+            val_loader,
             llm_client,
             llm_cfg,
             biomed_extractor,
@@ -1132,9 +1104,9 @@ def main():
         for path in checkpoints
     ]
 
-    # 保存本次 Test 的汇总排行榜。
+    # 保存所有 checkpoint 的汇总排行榜。
     leaderboard_path = os.path.join(
-        cfg.test_output_dir,
+        cfg.validation_output_dir,
         "leaderboard.json",
     )
 
@@ -1183,14 +1155,53 @@ def main():
             f"| {format_metric(result['normalized_exact_any_reference'])} |"
         )
 
+    best = max(
+        results,
+        key=lambda item: (
+            item["overall_strict_acc"]
+        ),
+    )
+
+    best_checkpoint = {
+        "dataset": "VQA-Med 2021",
+        "selection_split": "validation",
+        "selection_metric": "overall_strict_acc",
+        "selected_checkpoint": (
+            best["checkpoint"]
+        ),
+        "selected_checkpoint_path": (
+            best["checkpoint_path"]
+        ),
+        "validation_score": (
+            best["overall_strict_acc"]
+        ),
+        "ablation_id": cfg.ablation_id,
+        "seed": cfg.seed,
+        "stage1_seed": cfg.stage1_seed,
+    }
+
+    with open(
+        cfg.best_checkpoint_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            best_checkpoint,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
     print(
-        f"\nTest checkpoint mode："
-        f"{cfg.test_checkpoint_mode}"
+        f"\n最佳节点："
+        f"{best['checkpoint']} "
+        f"(Overall: "
+        f"{best['overall_strict_acc']:.2%})"
     )
 
     print(
-        f"Test 输出目录："
-        f"{cfg.test_output_dir}"
+        f"评测输出目录："
+        f"{cfg.validation_output_dir}"
     )
 
     print(

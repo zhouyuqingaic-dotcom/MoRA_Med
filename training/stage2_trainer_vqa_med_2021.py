@@ -8,7 +8,6 @@ from peft import set_peft_model_state_dict
 from safetensors.torch import load_file
 from torch.utils.data import (
     ConcatDataset,
-    Dataset,
     Subset,
 )
 from transformers import (
@@ -55,46 +54,6 @@ from utils.training.discriminative_optimizer import (
     format_optimizer_groups,
 )
 
-
-def maybe_limit_dataset(
-    dataset: Dataset,
-    max_samples,
-    split_name: str,
-    print_rank: int,
-):
-    """
-    Smoke Test 时截取数据集前 max_samples 条。
-
-    max_samples=None 时使用完整数据集。
-    """
-    if max_samples is None:
-        return dataset
-
-    max_samples = int(max_samples)
-
-    if max_samples <= 0:
-        raise ValueError(
-            f"{split_name} 的 max_samples 必须大于 0，"
-            f"当前为 {max_samples}。"
-        )
-
-    limit = min(
-        max_samples,
-        len(dataset),
-    )
-
-    limited_dataset = Subset(
-        dataset,
-        list(range(limit)),
-    )
-
-    ddp_print(
-        f"[Smoke Test] {split_name}: "
-        f"使用前 {limit}/{len(dataset)} 条样本。",
-        print_rank=print_rank,
-    )
-
-    return limited_dataset
 
 
 def filter_invalid_vqa_med_2021_samples(
@@ -306,128 +265,6 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def build_train_dataset(
-    cfg: Stage2TrainConfig,
-):
-    """
-    构造 VQA-Med 2021 Stage 2 训练集。
-
-    与当前 stage2_trainer_slake.py 和
-    stage2_trainer_vqa_med_2019.py 保持相同风格：
-
-    1. 分别加载 Train 与 Validation；
-    2. 分别执行可选 Smoke Test 截取；
-    3. 在 ConcatDataset / DDP DataLoader 前过滤无效监督；
-    4. 直接通过 ConcatDataset 中的列表决定如何组合。
-
-    当前默认：
-        只使用 Train。
-
-    切换为 Train + Validation 时，把：
-
-        [train_subset]
-
-    改成：
-
-        [train_subset, val_subset]
-
-    Test 永远不会在这里读取。
-    """
-    # ========================================================
-    # 1. Train
-    # ========================================================
-    train_subset = VQAMED2021Dataset(
-        jsonl_path=(
-            cfg.vqa_med_2021_train_jsonl_path
-        ),
-        expected_split="train",
-        expected_count=(
-            cfg.vqa_med_2021_train_expected_count
-        ),
-        verify_images=(
-            cfg.vqa_med_2021_verify_images
-        ),
-        strict=(
-            cfg.vqa_med_2021_dataset_strict
-        ),
-    )
-
-    train_subset = maybe_limit_dataset(
-        dataset=train_subset,
-        max_samples=(
-            cfg.max_vqa_med_2021_train_samples
-        ),
-        split_name="train",
-        print_rank=cfg.print_rank,
-    )
-
-    # ========================================================
-    # 2. Validation
-    # ========================================================
-    val_subset = VQAMED2021Dataset(
-        jsonl_path=(
-            cfg.vqa_med_2021_validation_jsonl_path
-        ),
-        expected_split="validation",
-        expected_count=(
-            cfg.vqa_med_2021_validation_expected_count
-        ),
-        verify_images=(
-            cfg.vqa_med_2021_verify_images
-        ),
-        strict=(
-            cfg.vqa_med_2021_dataset_strict
-        ),
-    )
-
-    val_subset = maybe_limit_dataset(
-        dataset=val_subset,
-        max_samples=(
-            cfg.max_vqa_med_2021_validation_samples
-        ),
-        split_name="validation",
-        print_rank=cfg.print_rank,
-    )
-
-    # ========================================================
-    # 3. 在 ConcatDataset 和 DDP DataLoader 前过滤
-    # ========================================================
-    train_subset = (
-        filter_invalid_vqa_med_2021_samples(
-            dataset=train_subset,
-            split_name="train",
-            print_rank=cfg.print_rank,
-        )
-    )
-
-    val_subset = (
-        filter_invalid_vqa_med_2021_samples(
-            dataset=val_subset,
-            split_name="validation",
-            print_rank=cfg.print_rank,
-        )
-    )
-
-    # ========================================================
-    # 4. 在这里直接决定训练集组合
-    # ========================================================
-    train_dataset = ConcatDataset(
-        # Train + Validation：
-        # [train_subset, val_subset]
-
-        # Train-only：
-        [train_subset]
-    )
-
-    ddp_print(
-        "✅ VQA-Med 2021 数据集清理与组合完成："
-        f"Train={len(train_subset)}，"
-        f"Validation={len(val_subset)}，"
-        f"实际参与训练={len(train_dataset)} 条。",
-        print_rank=cfg.print_rank,
-    )
-
-    return train_dataset
 
 def main():
     # ==========================================
@@ -504,20 +341,49 @@ def main():
             )
 
     # ==========================================
-    # 1. 加载 Train / Validation，并按 ConcatDataset 列表组合
+    # 1. 加载 VQA-Med 2021 Train + Validation
     # ==========================================
     ddp_print(
-        "⏳ [2/6] 正在构造 "
-        "VQA-Med 2021 训练数据集...",
+        "⏳ [2/6] 正在加载 "
+        "VQA-Med 2021 Train 和 Validation 数据集...",
         print_rank=cfg.print_rank,
     )
 
-    train_dataset = build_train_dataset(
-        cfg
+    train_subset = VQAMED2021Dataset(
+        jsonl_path=cfg.vqa_med_2021_train_jsonl_path,
+        expected_split="train",
+        expected_count=cfg.vqa_med_2021_train_expected_count,
+        verify_images=cfg.vqa_med_2021_verify_images,
+        strict=cfg.vqa_med_2021_dataset_strict,
+    )
+
+    val_subset = VQAMED2021Dataset(
+        jsonl_path=cfg.vqa_med_2021_validation_jsonl_path,
+        expected_split="validation",
+        expected_count=cfg.vqa_med_2021_validation_expected_count,
+        verify_images=cfg.vqa_med_2021_verify_images,
+        strict=cfg.vqa_med_2021_dataset_strict,
+    )
+
+    train_subset = filter_invalid_vqa_med_2021_samples(
+        dataset=train_subset,
+        split_name="train",
+        print_rank=cfg.print_rank,
+    )
+
+    val_subset = filter_invalid_vqa_med_2021_samples(
+        dataset=val_subset,
+        split_name="validation",
+        print_rank=cfg.print_rank,
+    )
+
+    train_dataset = ConcatDataset(
+        # [train_subset, val_subset]
+        [train_subset]
     )
 
     ddp_print(
-        "✅ 最终训练集构造完成，共有 "
+        f"✅ 数据集清理与组合完成，共有 "
         f"{len(train_dataset)} 条有效医学样本。",
         print_rank=cfg.print_rank,
     )

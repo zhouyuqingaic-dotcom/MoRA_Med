@@ -12,23 +12,19 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config.LLM_config import LLMAPIConfig
-# VQA-Med 2021 评测配置
-from config.vqa_med_2021.stage2_eval_config_vqa_med_2021 import (
-    Stage2EvalConfig,
-)
-# VQA-Med 2021 数据集
-from datas.vqa_med_2021_datasets import (
-    VQAMED2021Dataset,
-)
+from config.slake.stage2_eval_config_slake import Stage2EvalConfig
+from datas.slake_datasets import SLAKEDataset
 from LLM_api.deepseek import DeepSeekClient
-from utils.biomedclip.biomed_clip_loader import load_biomedclip
-# VQA-Med 2021 专属 collator
-from utils.data_tools.collator.vqa_med_2021.vqa_med_2021_eval_collator import (
-    VQAMED2021EvalCollator,
+from LLM_api.prompts.slake_prompt_builder_deepseek import (
+    build_llm_judge_user_prompt,
+    parse_llm_judge_response,
 )
-from utils.data_tools.prompt_cleaning.vqa_med_2021_answer_cleaning import (
-    vqa_med_2021_answer_eval_cleaning,
-    vqa_med_2021_references_eval_cleaning,
+from utils.biomedclip.biomed_clip_loader import load_biomedclip
+from utils.data_tools.collator.slake.slake_datasets_eval_collator import (
+    SLAKEEvalCollator,
+)
+from utils.data_tools.prompt_cleaning.slake_answer_cleaning import (
+    slake_answer_eval_cleaning,
 )
 from utils.qwen3vl.qwen3_vl_8B_lora_wrapper import (
     Qwen3VLLoraAndVisualAdapterWrapper,
@@ -172,95 +168,12 @@ def patch_generate_forward(model):
     )
 
 
-
-def build_llm_judge_user_prompt(
-    question,
-    references_raw,
-    references_norm,
-    pred_raw,
-    pred_norm,
-):
-    return (
-        f"Question: {str(question).strip()}\n"
-        "Raw Acceptable Ground Truth Answers: "
-        f"{json.dumps(list(references_raw), ensure_ascii=False)}\n"
-        "Normalized Acceptable Ground Truth Answers: "
-        f"{json.dumps(list(references_norm), ensure_ascii=False)}\n"
-        f"Raw Prediction: {str(pred_raw).strip()}\n"
-        f"Normalized Prediction: {str(pred_norm).strip()}\n\n"
-        "Each ground-truth item is an alternative acceptable answer. "
-        "Judge the prediction as correct when it is clinically equivalent "
-        "to any one acceptable answer. Return the raw JSON object directly."
-    )
-
-
-def parse_llm_judge_response(response_text):
-    if response_text == "ERROR":
-        return {
-            "score": "incorrect",
-            "reasoning": "API Request Failed.",
-        }
-
-    text = response_text.strip()
-
-    if text.startswith("```json"):
-        text = text[7:]
-    elif text.startswith("```"):
-        text = text[3:]
-
-    if text.endswith("```"):
-        text = text[:-3]
-
-    text = text.strip()
-
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError:
-        return {
-            "score": "incorrect",
-            "reasoning": (
-                "JSON Decode Error. "
-                f"Raw Output: {text}"
-            ),
-        }
-
-    if result.get("score") not in {
-        "correct",
-        "partially_correct",
-        "incorrect",
-    }:
-        return {
-            "score": "incorrect",
-            "reasoning": (
-                "Invalid Score generated. "
-                f"Raw Output: {text}"
-            ),
-        }
-
-    result["reasoning"] = (
-        result.get("reasoning")
-        or result.get("reason")
-        or result.get("explanation")
-        or "No reasoning provided by model."
-    )
-
-    return result
-
-
-def safe_accuracy(correct, total):
-    return correct / total if total else None
-
-
-def format_metric(value):
-    return "N/A" if value is None else f"{value:.2%}"
-
-
 def evaluate_checkpoint(
     weights_path,
     loader,
     processor,
     cfg,
-    test_loader,
+    val_loader,
     llm_client,
     llm_cfg,
     biomed_extractor,
@@ -269,7 +182,7 @@ def evaluate_checkpoint(
     完成单个 checkpoint 的完整评测：
 
     1. 重建并加载模型；
-    2. 在 VQA-Med 2021 test 上本地生成答案；
+    2. 在 SLAKE validation 上本地生成答案；
     3. 记录每条样本的 Router / Gate / Lambda；
     4. 对开放题未严格匹配样本执行 LLM Judge；
     5. 计算 Closed / Open / Overall Accuracy；
@@ -279,7 +192,7 @@ def evaluate_checkpoint(
 
     # 每个 checkpoint 拥有独立输出目录。
     output_dir = os.path.join(
-        cfg.test_output_dir,
+        cfg.validation_output_dir,
         name,
     )
     os.makedirs(
@@ -332,7 +245,7 @@ def evaluate_checkpoint(
     # =========================================================
     with torch.no_grad():
         for batch_inputs, metadata in tqdm(
-            test_loader,
+            val_loader,
             desc="Local Inference",
         ):
             # 将 Tensor 输入移动到模型所在设备。
@@ -481,59 +394,34 @@ def evaluate_checkpoint(
             ):
                 meta = metadata[i]
 
-                references_raw = [
-                    str(reference).strip()
-                    for reference in meta.get(
-                        "references",
-                        [],
-                    )
-                    if str(reference).strip()
-                ]
-
-                if not references_raw:
-                    gt_answer = str(
-                        meta.get(
-                            "gt_answer",
-                            "",
-                        )
-                    ).strip()
-
-                    if gt_answer:
-                        references_raw = [
-                            gt_answer
-                        ]
-
-                references_norm = (
-                    vqa_med_2021_references_eval_cleaning(
-                        references_raw
-                    )
+                gt_raw = meta.get(
+                    "gt_answer",
+                    meta.get("answer", ""),
                 )
 
-                if not references_norm:
-                    raise ValueError(
-                        "参考答案清洗后为空："
-                        f"index={meta.get('index')}"
+                # 统一清洗 GT 和预测答案后进行严格匹配。
+                gt_norm = (
+                    slake_answer_eval_cleaning(
+                        gt_raw
                     )
-
-                pred_raw = prediction.strip()
+                )
                 pred_norm = (
-                    vqa_med_2021_answer_eval_cleaning(
-                        pred_raw
+                    slake_answer_eval_cleaning(
+                        prediction
                     )
                 )
-
                 matched = (
-                    pred_norm in references_norm
+                    pred_norm == gt_norm
                 )
 
+                # SLAKE 中 CLOSED 通常对应 yes/no 等封闭式问题；
+                # 其余归为 OPEN。
                 category = (
                     "closed"
                     if (
-                        str(
-                            meta.get(
-                                "answer_type",
-                                "",
-                            )
+                        meta.get(
+                            "answer_type",
+                            "",
                         )
                         .strip()
                         .upper()
@@ -549,15 +437,26 @@ def evaluate_checkpoint(
                     ),
                     "question": meta["question"],
                     "question_category": category,
-                    "references_raw": references_raw,
-                    "references_norm": references_norm,
-                    "pred_raw": pred_raw,
+
+                    # 原始答案和清洗后的答案。
+                    "gt_raw": gt_raw,
+                    "gt_norm": gt_norm,
+                    "pred_raw": prediction.strip(),
                     "pred_norm": pred_norm,
+
+                    # 本地字符串严格匹配结果。
                     "is_norm_match": matched,
+
+                    # 开放题未严格匹配时，由 LLM Judge 补充。
                     "llm_judge_score": None,
                     "llm_judge_reason": None,
                     "llm_judge_raw_response": None,
+
+                    # 默认使用严格匹配结果；
+                    # LLM Judge 后可能被更新。
                     "final_correct": matched,
+
+                    # A0 中以下诊断字段保持 None。
                     "routing_f3": None,
                     "routing_f5": None,
                     "routing_f7": None,
@@ -576,12 +475,15 @@ def evaluate_checkpoint(
                     record["routing_f7"] = float(
                         routing[i, 2]
                     )
+
                     record["residual_gate"] = float(
                         gate[i]
                     )
                     record["lambda_value"] = (
                         lambda_value
                     )
+
+                    # 当前样本实际使用的整体残差系数。
                     record[
                         "effective_residual_scale"
                     ] = (
@@ -599,17 +501,12 @@ def evaluate_checkpoint(
     # =========================================================
     # Phase 2：LLM Judge
     # =========================================================
-    system_prompt = (
-        llm_cfg.medical_vqa_llm_judge_system_prompt
-        + "\nFor VQA-Med 2021, multiple ground truths are "
-          "alternative acceptable answers. A prediction is correct "
-          "if it is clinically equivalent to any one of them."
-    )
-
     for record in tqdm(
         records,
         desc="LLM Judging",
     ):
+        # Closed 问题只使用严格匹配；
+        # Open 问题严格匹配失败时才调用 LLM Judge。
         if (
             record["question_category"]
             == "open"
@@ -617,18 +514,14 @@ def evaluate_checkpoint(
         ):
             prompt = build_llm_judge_user_prompt(
                 question=record["question"],
-                references_raw=(
-                    record["references_raw"]
-                ),
-                references_norm=(
-                    record["references_norm"]
-                ),
+                gt_raw=record["gt_raw"],
+                gt_norm=record["gt_norm"],
                 pred_raw=record["pred_raw"],
                 pred_norm=record["pred_norm"],
             )
 
             response = llm_client.ask(
-                system_prompt,
+                llm_cfg.medical_vqa_llm_judge_system_prompt,
                 prompt,
             )
 
@@ -639,13 +532,18 @@ def evaluate_checkpoint(
             record[
                 "llm_judge_raw_response"
             ] = response
+
             record["llm_judge_score"] = (
                 judged["score"]
             )
             record["llm_judge_reason"] = (
-                judged["reasoning"]
+                    judged.get("reasoning")
+                    or judged.get("reason")
+                    or judged.get("explanation")
             )
 
+            # 当前 strict 指标只把 correct 计为正确；
+            # partially_correct 不计入最终准确率。
             record["final_correct"] = (
                 judged["score"] == "correct"
             )
@@ -656,15 +554,19 @@ def evaluate_checkpoint(
     closed = [
         item
         for item in records
-        if item["question_category"]
-        == "closed"
+        if (
+            item["question_category"]
+            == "closed"
+        )
     ]
 
     opened = [
         item
         for item in records
-        if item["question_category"]
-        == "open"
+        if (
+            item["question_category"]
+            == "open"
+        )
     ]
 
     closed_correct = sum(
@@ -677,31 +579,21 @@ def evaluate_checkpoint(
         for item in opened
     )
 
-    exact_correct = sum(
-        item["is_norm_match"]
-        for item in records
-    )
-
     result = {
         "checkpoint": name,
         "checkpoint_path": os.path.abspath(
             weights_path
         ),
-        "closed_acc": safe_accuracy(
-            closed_correct,
-            len(closed),
+        "closed_acc": (
+            closed_correct / len(closed)
         ),
-        "open_strict_acc": safe_accuracy(
-            open_correct,
-            len(opened),
+        "open_strict_acc": (
+            open_correct / len(opened)
         ),
         "overall_strict_acc": (
             closed_correct
             + open_correct
         ) / len(records),
-        "normalized_exact_any_reference": (
-            exact_correct / len(records)
-        ),
     }
 
     # =========================================================
@@ -931,35 +823,6 @@ def evaluate_checkpoint(
 
 
 def get_checkpoints(cfg):
-    if (
-        cfg.test_checkpoint_mode
-        == "best_validation"
-    ):
-        if not os.path.isfile(
-            cfg.best_checkpoint_path
-        ):
-            raise FileNotFoundError(
-                "找不到 Validation 最佳节点记录："
-                f"{cfg.best_checkpoint_path}\n"
-                "请先运行对应的 "
-                "stage2_validate_checkpoints_*.py。"
-            )
-
-        with open(
-            cfg.best_checkpoint_path,
-            "r",
-            encoding="utf-8",
-        ) as file:
-            best = json.load(file)
-
-        checkpoint_path = (
-            best["selected_checkpoint_path"]
-        )
-
-        return [
-            checkpoint_path
-        ]
-
     final_weights = os.path.join(
         cfg.stage2_run_dir,
         "final_weights",
@@ -984,12 +847,13 @@ def get_checkpoints(cfg):
 
     return checkpoints
 
+
 def main():
     cfg = Stage2EvalConfig()
 
-    # 创建 Test 输出目录。
+    # 创建当前实验统一评测目录。
     os.makedirs(
-        cfg.test_output_dir,
+        cfg.validation_output_dir,
         exist_ok=True,
     )
 
@@ -1058,25 +922,18 @@ def main():
         )
 
     # =========================================================
-    # 3. VQA-Med 2021 Test DataLoader
+    # 3. SLAKE Validation DataLoader
     # =========================================================
-    dataset = VQAMED2021Dataset(
-        jsonl_path=(
-            cfg.vqa_med_2021_test_jsonl_path
+    dataset = SLAKEDataset(
+        json_path=(
+            cfg.slake_val_json_path
         ),
-        expected_split="test",
-        expected_count=(
-            cfg.vqa_med_2021_test_expected_count
-        ),
-        verify_images=(
-            cfg.vqa_med_2021_verify_images
-        ),
-        strict=(
-            cfg.vqa_med_2021_dataset_strict
+        image_root=(
+            cfg.slake_image_root
         ),
     )
 
-    collator = VQAMED2021EvalCollator(
+    collator = SLAKEEvalCollator(
         processor=processor,
         cfg=cfg,
         biomed_transform=(
@@ -1087,7 +944,7 @@ def main():
         ),
     )
 
-    test_loader = DataLoader(
+    val_loader = DataLoader(
         dataset,
         batch_size=(
             cfg.per_device_eval_batch_size
@@ -1124,7 +981,7 @@ def main():
             loader,
             processor,
             cfg,
-            test_loader,
+            val_loader,
             llm_client,
             llm_cfg,
             biomed_extractor,
@@ -1132,9 +989,9 @@ def main():
         for path in checkpoints
     ]
 
-    # 保存本次 Test 的汇总排行榜。
+    # 保存所有 checkpoint 的汇总排行榜。
     leaderboard_path = os.path.join(
-        cfg.test_output_dir,
+        cfg.validation_output_dir,
         "leaderboard.json",
     )
 
@@ -1156,7 +1013,7 @@ def main():
     print(
         "\n\n"
         + "🏆" * 20
-        + " VQA-Med 2021 评测结果 "
+        + " SLAKE 评测结果 "
         + "🏆" * 20
     )
 
@@ -1165,32 +1022,69 @@ def main():
         f"({cfg.ablation_id}) "
         "| Closed Acc "
         "| Open Acc "
-        "| Overall Acc "
-        "| Exact-Any-Ref |"
+        "| Overall Acc |"
     )
 
     print(
         "| :--- | :---: "
-        "| :---: | :---: | :---: |"
+        "| :---: | :---: |"
     )
 
     for result in results:
         print(
             f"| {result['checkpoint']} "
-            f"| {format_metric(result['closed_acc'])} "
-            f"| {format_metric(result['open_strict_acc'])} "
-            f"| {format_metric(result['overall_strict_acc'])} "
-            f"| {format_metric(result['normalized_exact_any_reference'])} |"
+            f"| {result['closed_acc']:.2%} "
+            f"| {result['open_strict_acc']:.2%} "
+            f"| {result['overall_strict_acc']:.2%} |"
+        )
+
+    best = max(
+        results,
+        key=lambda item: (
+            item["overall_strict_acc"]
+        ),
+    )
+
+    best_checkpoint = {
+        "dataset": "SLAKE",
+        "selection_split": "validation",
+        "selection_metric": "overall_strict_acc",
+        "selected_checkpoint": (
+            best["checkpoint"]
+        ),
+        "selected_checkpoint_path": (
+            best["checkpoint_path"]
+        ),
+        "validation_score": (
+            best["overall_strict_acc"]
+        ),
+        "ablation_id": cfg.ablation_id,
+        "seed": cfg.seed,
+        "stage1_seed": cfg.stage1_seed,
+    }
+
+    with open(
+        cfg.best_checkpoint_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            best_checkpoint,
+            file,
+            ensure_ascii=False,
+            indent=2,
         )
 
     print(
-        f"\nTest checkpoint mode："
-        f"{cfg.test_checkpoint_mode}"
+        f"\n最佳节点："
+        f"{best['checkpoint']} "
+        f"(Overall: "
+        f"{best['overall_strict_acc']:.2%})"
     )
 
     print(
-        f"Test 输出目录："
-        f"{cfg.test_output_dir}"
+        f"评测输出目录："
+        f"{cfg.validation_output_dir}"
     )
 
     print(

@@ -44,7 +44,7 @@ class Stage2TrainConfig:
     # 常用：
     #   A0：LoRA-only baseline
     #   A6：MoRA 强视觉残差版本
-    ablation_id: str = "A6" #"A0"
+    ablation_id: str = "A0" #"A6" #"A0"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -92,11 +92,6 @@ class Stage2TrainConfig:
         "For yes/no questions, answer with yes or no. "
         "Do not add unnecessary explanation."
     )
-
-    # Smoke test；None 表示使用完整划分。
-    max_vqa_med_2021_train_samples: Optional[int] = None
-    max_vqa_med_2021_validation_samples: Optional[int] = None
-    max_vqa_med_2021_test_samples: Optional[int] = None
 
     # =========================================================
     # 3. Qwen3-VL 与量化
@@ -157,11 +152,11 @@ class Stage2TrainConfig:
     num_train_epochs: float = 3.0
 
     # A6-DLR 时设置为 True；A0 必须为 False。
-    use_discriminative_lr: bool = True
+    use_discriminative_lr: bool = False
     lr_recipe_name: str = "DLR"
 
     # 所加载的 Stage 1 是否为 DLR 版本。
-    stage1_use_discriminative_lr: bool = True
+    stage1_use_discriminative_lr: bool = False
     stage1_lr_recipe_name: str = "DLR"
 
     # 统一学习率，同时作为 Hugging Face Trainer 的基础显示学习率。
@@ -270,33 +265,6 @@ class Stage2TrainConfig:
             if not isinstance(count, int) or count <= 0:
                 raise ValueError(
                     f"{split} expected_count 必须是正整数，当前为 {count!r}。"
-                )
-
-        sample_limits = {
-            "train": (
-                self.max_vqa_med_2021_train_samples,
-                self.vqa_med_2021_train_expected_count,
-            ),
-            "validation": (
-                self.max_vqa_med_2021_validation_samples,
-                self.vqa_med_2021_validation_expected_count,
-            ),
-            "test": (
-                self.max_vqa_med_2021_test_samples,
-                self.vqa_med_2021_test_expected_count,
-            ),
-        }
-        for split, (limit, full_count) in sample_limits.items():
-            if limit is None:
-                continue
-            if not isinstance(limit, int) or limit <= 0:
-                raise ValueError(
-                    f"max_{split}_samples 必须是正整数或 None，"
-                    f"当前为 {limit!r}。"
-                )
-            if limit > full_count:
-                raise ValueError(
-                    f"max_{split}_samples={limit} 超过官方规模 {full_count}。"
                 )
 
         for name, path in {
