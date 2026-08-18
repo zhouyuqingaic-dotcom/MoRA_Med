@@ -48,21 +48,31 @@ class TrainConfig:
         use_rms_norm=False
 
     A5:
-        Full RoMA-Net V2-lite
-        scale_mode="learned"
+        RoMA-Net Fixed Router
+
+        scale_mode="fixed"
+        fixed_scale_weights=[1/3,1/3,1/3]
+
         gate_mode="learned"
+        gate_init=0.5
+
         lambda_mode="learnable"
-        lambda_init=0.1
+        lambda_init=0.9
         lambda_max=1.0
+
         use_rms_norm=True
 
     A6:
         Strong visual residual injection
         scale_mode="learned"
+
         gate_mode="learned"
         gate_init=0.5
-        lambda_mode="fixed"
-        fixed_lambda=1.0
+
+        lambda_mode="learnable"
+        lambda_init=0.9
+        lambda_max=1.0
+
         use_rms_norm=True
     """
 
@@ -74,7 +84,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A0" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -177,9 +187,9 @@ class TrainConfig:
 
     # False 表示使用旧 A6 的统一学习率。
     # True 表示使用新的 A6-DLR。
-    # use_discriminative_lr: bool = True
+    use_discriminative_lr: bool = True
     #跑A0的时候设置为False
-    use_discriminative_lr: bool = False
+    # use_discriminative_lr: bool = False
 
     # 用于输出目录命名。
     lr_recipe_name: str = "DLR"
@@ -269,7 +279,7 @@ class TrainConfig:
 
     # learnable lambda 的上界和初始化值
     lambda_max: float = 1.0
-    lambda_init: float = 0.1
+    lambda_init: float = 0.9
 
     # -----------------------------
     # RMS residual normalization
@@ -378,29 +388,43 @@ class TrainConfig:
 
         elif aid == "A5":
             # -------------------------------------------------
-            # 完整 RoMA-Net V2-lite。
+            # w/o Dynamic Scale Routing
+            #
+            # F3/F5/F7 使用固定均匀权重 1/3；
+            # 保留 BioMedCLIP-conditioned learned gate；
+            # 保留 RMS residual matching。
+            #
+            # lambda_mode / lambda_init / fixed_lambda
+            # 由 dataclass 配置决定，不在这里强制覆盖。
+            # DLR 同样由 dataclass 配置决定。
             # -------------------------------------------------
             self.enable_visual_adapter = True
 
-            self.scale_mode = "learned"
+            # 固定均匀专家融合
+            self.scale_mode = "fixed"
+            self.fixed_scale_weights = [
+                1.0 / 3.0,
+                1.0 / 3.0,
+                1.0 / 3.0,
+            ]
 
             self.gate_mode = "learned"
 
             self.lambda_mode = "learnable"
-            self.lambda_init = 0.1
-            self.lambda_max = 1.0
 
             self.use_rms_norm = True
 
         elif aid == "A6":
             # -------------------------------------------------
-            # 强视觉残差注入实验。
+            # Full MoRA-Med
             #
-            # effective residual scale = fixed_lambda * gate
-            # 初始状态约为：
-            # 1.0 * 0.5 = 0.5
+            # BioMedCLIP-conditioned dynamic scale routing
+            # + sample-wise learned gate
+            # + RMS residual matching.
             #
-            # lambda 固定，仅由样本级 Gate 控制残差强度。
+            # lambda_mode / lambda_init / fixed_lambda
+            # 由 dataclass 配置决定。
+            # DLR 由 dataclass 配置决定。
             # -------------------------------------------------
             self.enable_visual_adapter = True
 
@@ -409,11 +433,6 @@ class TrainConfig:
 
             # 样本级 residual gate
             self.gate_mode = "learned"
-            self.gate_init = 0.5
-
-            # 强制固定 lambda=1.0
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 1.0
 
             # 保持 residual RMS normalization
             self.use_rms_norm = True
