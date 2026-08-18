@@ -497,6 +497,16 @@ class TrainConfig:
                 else "A6"
             )
 
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
             experiment_name = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.mimic_cxr_cache_prefix}_"
@@ -504,7 +514,7 @@ class TrainConfig:
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
-                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
                 f"Seed-{self.seed}"
             )
