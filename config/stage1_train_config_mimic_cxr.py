@@ -40,12 +40,19 @@ class TrainConfig:
         fixed_lambda=0.1
         use_rms_norm=True
 
-    A4 optional:
-        Full w/o RMS
+    A4:
+        w/o Adaptive Gate
+
         scale_mode="learned"
-        gate_mode="learned"
+
+        gate_mode="fixed"
+        fixed_gate=0.5
+
         lambda_mode="learnable"
-        use_rms_norm=False
+        lambda_init=0.9
+        lambda_max=1.0
+
+        use_rms_norm=True
 
     A5:
         RoMA-Net Fixed Router
@@ -84,7 +91,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A4" #"A5" #"A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -244,7 +251,7 @@ class TrainConfig:
     # -----------------------------
     # learned: BioMedCLIP-aware router 学习 π3/π5/π7
     # fixed: 使用 fixed_scale_weights
-    scale_mode: str = "learned"
+    scale_mode: str = "learned" #"learned"
 
     fixed_scale_weights: list[float] = field(
         default_factory=lambda: [
@@ -259,10 +266,10 @@ class TrainConfig:
     # -----------------------------
     # learned: g = sigmoid(MLP_g(h_route))
     # fixed: g = fixed_gate
-    gate_mode: str = "learned"
+    gate_mode: str = "fixed" #"learned"
 
     # w/o soft gate 时设为 1.0
-    fixed_gate: float = 1.0
+    fixed_gate: float = 0.5
 
     # learned gate 的初始化值
     gate_init: float = 0.5
@@ -275,7 +282,7 @@ class TrainConfig:
     lambda_mode: str = "learnable"
 
     # fixed-alpha 消融时使用
-    fixed_lambda: float = 0.1
+    fixed_lambda: float = 0.9
 
     # learnable lambda 的上界和初始化值
     lambda_max: float = 1.0
@@ -370,21 +377,36 @@ class TrainConfig:
 
             self.use_rms_norm = True
 
+
         elif aid == "A4":
+
             # -------------------------------------------------
-            # 完整 RoMA-Net V2-lite，但不使用 RMS normalization。
+            # w/o Adaptive Gate
+            # 保留：
+            # - BioMedCLIP-conditioned dynamic routing
+            # - learnable global lambda
+            # - RMS residual matching
+            # - DLR
+            #
+            # 唯一去掉：
+            # - sample-wise learned gate
+            #
+            # 用 fixed gate=0.5，与 Full MoRA-Med 的 gate_init
+            # 保持相同初始残差强度。
             # -------------------------------------------------
             self.enable_visual_adapter = True
 
+            # 保留动态专家路由
             self.scale_mode = "learned"
 
-            self.gate_mode = "learned"
+            # 去掉 adaptive gate
+            self.gate_mode = "fixed"
 
+            # 与 Full A6 保持一致
             self.lambda_mode = "learnable"
-            self.lambda_init = 0.1
-            self.lambda_max = 1.0
 
-            self.use_rms_norm = False
+            # 保留 RMS matching
+            self.use_rms_norm = True
 
         elif aid == "A5":
             # -------------------------------------------------
@@ -487,6 +509,78 @@ class TrainConfig:
                 f"Stage1_MIMIC_CXR_"
                 f"{self.mimic_cxr_cache_prefix}_"
                 f"A0_LoRAOnly_"
+                f"Seed-{self.seed}"
+            )
+
+        elif self.ablation_id == "A4":
+            a4_label = (
+                f"A4-{self.lr_recipe_name}"
+                if self.use_discriminative_lr
+                else "A4"
+            )
+
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
+            gate_label = (
+                f"Gate-fixed-{self.fixed_gate:g}"
+                if self.gate_mode == "fixed"
+                else f"Gate-learned-Init-{self.gate_init:g}"
+            )
+
+            experiment_name = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.mimic_cxr_cache_prefix}_"
+                f"{a4_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-learned_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.seed}"
+            )
+
+
+        elif self.ablation_id=="A5":
+
+            a5_label = (
+                f"A5-{self.lr_recipe_name}"
+                if self.use_discriminative_lr
+                else "A5"
+            )
+
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+                if self.gate_mode == "learned"
+                else f"Gate-fixed-{self.fixed_gate:g}"
+            )
+
+            experiment_name = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.mimic_cxr_cache_prefix}_"
+                f"{a5_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-fixed-Uniform-1over3_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
                 f"Seed-{self.seed}"
             )
 

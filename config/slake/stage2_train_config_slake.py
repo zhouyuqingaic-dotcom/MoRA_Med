@@ -40,7 +40,7 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A0" #"A6" #"A6" #"A0" #"A5"
+    ablation_id: str = "A5" #"A0" #"A6" #"A6" #"A0" #"A5"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -133,16 +133,16 @@ class Stage2TrainConfig:
     # A6-DLR 分组学习率
     # =========================================================
     #使用"A6-DLR"模式时候为true
-    # use_discriminative_lr: bool = True
+    use_discriminative_lr: bool = True
     #使用"A0"模式时候设置为False
-    use_discriminative_lr: bool = False
+    # use_discriminative_lr: bool = False
 
     lr_recipe_name: str = "DLR"
 
     # # Stage 2 加载的 Stage 1 是否为 DLR 版本。
-    # stage1_use_discriminative_lr: bool = True
+    stage1_use_discriminative_lr: bool = True
     # Stage 2 加载的 Stage 1 是否不为 DLR 版本,这个设置为False。
-    stage1_use_discriminative_lr: bool = False
+    # stage1_use_discriminative_lr: bool = False
 
     stage1_lr_recipe_name: str = "DLR"
 
@@ -191,10 +191,11 @@ class Stage2TrainConfig:
     fixed_gate: float = 1.0
     gate_init: float = 0.5
 
+    #也可以设置为fixed
     lambda_mode: str = "learnable"
-    fixed_lambda: float = 0.1
+    fixed_lambda: float = 1.0
+    lambda_init: float = 0.9
     lambda_max: float = 1.0
-    lambda_init: float = 0.1
 
     use_rms_norm: bool = True
     residual_norm_eps: float = 1e-6
@@ -276,41 +277,40 @@ class Stage2TrainConfig:
 
         elif aid == "A5":
             self.enable_visual_adapter = True
-            self.scale_mode = "learned"
-            self.gate_mode = "learned"
-            self.lambda_mode = "learnable"
-            self.lambda_init = 0.1
-            self.lambda_max = 1.0
-            self.use_rms_norm = True
+            # No dynamic router: uniform fixed expert weights
+            self.scale_mode = "fixed"
+            self.fixed_scale_weights = [
+                1.0 / 3.0,
+                1.0 / 3.0,
+                1.0 / 3.0,
+            ]
 
-            self.use_discriminative_lr = False
-            self.stage1_use_discriminative_lr = False
+            self.gate_mode = "learned"
+
+            # lambda 由 dataclass 决定
+            self.use_rms_norm = True
 
         elif aid == "A6":
             # -------------------------------------------------
-            # 强视觉残差注入实验。
+            # Full MoRA-Med
             #
-            # effective residual scale = fixed_lambda * gate
-            # Stage 1 初始约为：
-            # 1.0 * 0.5 = 0.5
+            # BioMedCLIP-conditioned dynamic scale routing
+            # + sample-wise learned gate
+            # + RMS residual matching.
             #
-            # Stage 2 会继承 Stage 1 已训练的 Gate 参数，
-            # gate_init 主要用于保持结构与配置语义一致。
+            # lambda_mode / lambda_init / fixed_lambda
+            # 由 dataclass 配置决定。
+            # DLR 由 dataclass 配置决定。
             # -------------------------------------------------
             self.enable_visual_adapter = True
 
-            # BioMedCLIP-conditioned F3/F5/F7 动态路由
+            # BioMedCLIP-conditioned F3/F5/F7 dynamic routing
             self.scale_mode = "learned"
 
-            # 样本级 residual gate
+            # Sample-wise residual gate
             self.gate_mode = "learned"
-            self.gate_init = 0.5
 
-            # 固定 lambda=1.0
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 1.0
-
-            # 保留 residual RMS normalization
+            # RMS residual matching
             self.use_rms_norm = True
 
         else:
@@ -331,12 +331,58 @@ class Stage2TrainConfig:
                 f"Seed-{self.stage1_seed}"
             )
 
+        elif self.ablation_id == "A5":
+            stage1_a5_label = (
+                f"A5-{self.stage1_lr_recipe_name}"
+                if self.stage1_use_discriminative_lr
+                else "A5"
+            )
+
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+                if self.gate_mode == "learned"
+                else f"Gate-fixed-{self.fixed_gate:g}"
+            )
+
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage1_a5_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-fixed-Uniform-1over3_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.stage1_seed}"
+            )
+
+
         elif self.ablation_id == "A6":
             stage1_a6_label = (
                 f"A6-{self.stage1_lr_recipe_name}"
                 if self.stage1_use_discriminative_lr
                 else "A6"
             )
+
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
 
             stage1_experiment_dir = (
                 f"Stage1_MIMIC_CXR_"
@@ -345,7 +391,7 @@ class Stage2TrainConfig:
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
-                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
                 f"Seed-{self.stage1_seed}"
             )
@@ -382,12 +428,58 @@ class Stage2TrainConfig:
                 f"Seed-{self.seed}"
             )
 
+        elif self.ablation_id == "A5":
+            stage2_a5_label = (
+                f"A5-{self.lr_recipe_name}"
+                if self.use_discriminative_lr
+                else "A5"
+            )
+
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+                if self.gate_mode == "learned"
+                else f"Gate-fixed-{self.fixed_gate:g}"
+            )
+
+            stage2_experiment_dir = (
+                f"Stage2_SLAKE_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage2_a5_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-fixed-Uniform-1over3_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
         elif self.ablation_id == "A6":
             stage2_a6_label = (
                 f"A6-{self.lr_recipe_name}"
                 if self.use_discriminative_lr
                 else "A6"
             )
+
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
 
             stage2_experiment_dir = (
                 f"Stage2_SLAKE_"
@@ -396,7 +488,7 @@ class Stage2TrainConfig:
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
-                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
