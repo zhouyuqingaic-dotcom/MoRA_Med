@@ -40,7 +40,7 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A4" #"A0" #"A6" #"A6" #"A0" #"A5"
+    ablation_id: str = "A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -187,13 +187,13 @@ class Stage2TrainConfig:
         ]
     )
 
-    gate_mode: str = "fixed"
+    gate_mode: str = "learned" #"fixed"
     fixed_gate: float = 0.5
     gate_init: float = 0.5
 
     #也可以设置为fixed
-    lambda_mode: str = "learnable"
-    fixed_lambda: float = 1.0
+    lambda_mode: str = "learnable" #"fixed"
+    fixed_lambda: float = 0.9
     lambda_init: float = 0.9
     lambda_max: float = 1.0
 
@@ -252,17 +252,24 @@ class Stage2TrainConfig:
             self.use_discriminative_lr = False
             self.stage1_use_discriminative_lr = False
 
+
         elif aid == "A3":
+            # -------------------------------------------------
+            # w/o Learnable Lambda
+            # 唯一消融：learnable lambda -> fixed lambda = 0.9
+            # -------------------------------------------------
             self.enable_visual_adapter = True
+
             self.scale_mode = "learned"
             self.gate_mode = "learned"
+
             self.lambda_mode = "fixed"
-            self.fixed_lambda = 0.1
+
             self.use_rms_norm = True
 
-            self.use_discriminative_lr = False
-            self.stage1_use_discriminative_lr = False
-
+            # 与 Full A6 一样保留 DLR
+            self.use_discriminative_lr = True
+            self.stage1_use_discriminative_lr = True
 
         elif aid == "A4":
 
@@ -346,6 +353,36 @@ class Stage2TrainConfig:
                 f"A0_LoRAOnly_"
                 f"Seed-{self.stage1_seed}"
             )
+
+        elif self.ablation_id == "A3":
+            stage1_a3_label = (
+                f"A3-{self.stage1_lr_recipe_name}"
+                if self.stage1_use_discriminative_lr
+                else "A3"
+            )
+
+            lambda_label = (
+                f"Lambda-fixed-{self.fixed_lambda:g}"
+            )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+                if self.gate_mode == "learned"
+                else f"Gate-fixed-{self.fixed_gate:g}"
+            )
+
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage1_a3_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-learned_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.stage1_seed}"
+            )
+
 
         elif self.ablation_id == "A4":
             stage1_a4_label = (
@@ -479,6 +516,37 @@ class Stage2TrainConfig:
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
             )
+
+        elif self.ablation_id == "A3":
+            stage2_a3_label = (
+                f"A3-{self.lr_recipe_name}"
+                if self.use_discriminative_lr
+                else "A3"
+            )
+
+            lambda_label = (
+                f"Lambda-fixed-{self.fixed_lambda:g}"
+            )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+                if self.gate_mode == "learned"
+                else f"Gate-fixed-{self.fixed_gate:g}"
+            )
+
+            stage2_experiment_dir = (
+                f"Stage2_SLAKE_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage2_a3_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-learned_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
 
         elif self.ablation_id == "A4":
             stage2_a4_label = (
