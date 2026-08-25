@@ -28,7 +28,7 @@ class Stage2EvalConfig(Stage2TrainConfig):
     test_checkpoint_mode: str = "best_validation"
 
     # 必须对应要评测的 Stage 2 实验
-    ablation_id: str = "A3" #"A4" #"A5" #"A6" #"A0" #"A0" #"A5"
+    ablation_id: str = "A2" #"A3" #"A4" #"A5" #"A6" #"A0" #"A0" #"A5"
 
     # 当前评测 A6-DLR。
     # 若评测普通 A6，将这两个字段改为 False。
