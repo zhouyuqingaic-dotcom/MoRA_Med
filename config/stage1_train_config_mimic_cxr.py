@@ -14,13 +14,20 @@ class TrainConfig:
         enable_visual_adapter=False
 
     A1:
-        v2 fixed-alpha, w/o soft gate
+        w/o DLR
+
         scale_mode="learned"
-        gate_mode="fixed"
-        fixed_gate=1.0
-        lambda_mode="fixed"
-        fixed_lambda=0.1
+
+        gate_mode="learned"
+        gate_init=0.5
+
+        lambda_mode="learnable"
+        lambda_init=0.9
+        lambda_max=1.0
+
         use_rms_norm=True
+
+        use_discriminative_lr=False
 
     A2:
         w/o RMS Matching
@@ -99,7 +106,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A2" #"A3" #"A4" #"A5" #"A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A1" #"A2" #"A3" #"A4" #"A5" #"A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -338,20 +345,26 @@ class TrainConfig:
 
         elif aid == "A1":
             # -------------------------------------------------
-            # 学习多尺度路由 π，但不使用 soft gate。
-            # residual 强度使用固定 alpha/lambda。
+            # w/o DLR
+            #
+            # 保留 Full MoRA-Med：
+            # - dynamic routing
+            # - adaptive gate
+            # - learnable lambda
+            # - RMS residual matching
+            #
+            # 唯一消融：
+            # - discriminative learning rate
             # -------------------------------------------------
             self.enable_visual_adapter = True
-
             self.scale_mode = "learned"
-
-            self.gate_mode = "fixed"
-            self.fixed_gate = 1.0
-
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 0.1
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
 
             self.use_rms_norm = True
+
+            # 唯一变化
+            self.use_discriminative_lr = False
 
         elif aid == "A2":
             # -------------------------------------------------
@@ -534,6 +547,30 @@ class TrainConfig:
                 f"Stage1_MIMIC_CXR_"
                 f"{self.mimic_cxr_cache_prefix}_"
                 f"A0_LoRAOnly_"
+                f"Seed-{self.seed}"
+            )
+
+        elif self.ablation_id == "A1":
+            a1_label = "A1-NoDLR"
+
+            lambda_label = (
+                f"Lambda-learnable-Init-{self.lambda_init:g}"
+                f"-Max-{self.lambda_max:g}"
+            )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+            )
+
+            experiment_name = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.mimic_cxr_cache_prefix}_"
+                f"{a1_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-learned_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
                 f"Seed-{self.seed}"
             )
 

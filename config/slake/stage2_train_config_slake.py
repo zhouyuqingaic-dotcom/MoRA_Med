@@ -40,7 +40,7 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A2" #"A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
+    ablation_id: str = "A1" #"A2" #"A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -227,16 +227,20 @@ class Stage2TrainConfig:
             self.stage1_use_discriminative_lr = False
 
         elif aid == "A1":
+            # -------------------------------------------------
+            # w/o DLR
+            #
+            # Full MoRA-Med architecture
+            # 唯一关闭 discriminative learning rate
+            # -------------------------------------------------
             self.enable_visual_adapter = True
             self.scale_mode = "learned"
-            self.gate_mode = "fixed"
-            self.fixed_gate = 1.0
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 0.1
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
             self.use_rms_norm = True
-
-
+            # 唯一消融：DLR
             self.use_discriminative_lr = False
+            # Stage 1 来源也是 no-DLR A1
             self.stage1_use_discriminative_lr = False
 
         elif aid == "A2":
@@ -355,6 +359,30 @@ class Stage2TrainConfig:
                 f"Stage1_MIMIC_CXR_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
                 f"A0_LoRAOnly_"
+                f"Seed-{self.stage1_seed}"
+            )
+
+        elif self.ablation_id == "A1":
+            stage1_a1_label = "A1-NoDLR"
+
+            lambda_label = (
+                f"Lambda-learnable-Init-{self.lambda_init:g}"
+                f"-Max-{self.lambda_max:g}"
+            )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+            )
+
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage1_a1_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-learned_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
                 f"Seed-{self.stage1_seed}"
             )
 
@@ -548,6 +576,32 @@ class Stage2TrainConfig:
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
             )
+
+        elif self.ablation_id == "A1":
+            stage2_a1_label = "A1-NoDLR"
+
+            lambda_label = (
+                f"Lambda-learnable-Init-{self.lambda_init:g}"
+                f"-Max-{self.lambda_max:g}"
+            )
+
+            gate_label = (
+                f"Gate-learned-Init-{self.gate_init:g}"
+            )
+
+            stage2_experiment_dir = (
+                f"Stage2_SLAKE_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{stage2_a1_label}_"
+                f"Experts-Conv2D-F3_F5_F7_"
+                f"Scale-learned_"
+                f"{gate_label}_"
+                f"{lambda_label}_"
+                f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
 
         elif self.ablation_id == "A2":
             stage2_a2_label = (
