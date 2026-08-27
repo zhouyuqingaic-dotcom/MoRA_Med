@@ -40,7 +40,7 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A1" #"A2" #"A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
+    ablation_id: str = "A0" #"A1" #"A2" #"A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -215,16 +215,17 @@ class Stage2TrainConfig:
         # 必须与 Stage 1 TrainConfig 的消融定义完全相同
         # -----------------------------------------------------
         if aid == "A0":
+            # -------------------------------------------------
+            # Pure Qwen3-VL + LoRA baseline
+            # -------------------------------------------------
             self.enable_visual_adapter = False
-            self.scale_mode = "learned"
-            self.gate_mode = "fixed"
-            self.fixed_gate = 1.0
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 0.0
-            self.use_rms_norm = False
 
+            # Stage 2 同样使用普通统一 LR
             self.use_discriminative_lr = False
+
+            # Stage 1 来源也是 Pure LoRA / No-DLR
             self.stage1_use_discriminative_lr = False
+
 
         elif aid == "A1":
             # -------------------------------------------------
@@ -355,12 +356,17 @@ class Stage2TrainConfig:
         # 必须与 Stage 1 TrainConfig 的命名规则完全一致。
         # -----------------------------------------------------
         if self.ablation_id == "A0":
+            stage1_a0_label = "A0-LoRAOnly-NoDLR"
+
             stage1_experiment_dir = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A0_LoRAOnly_"
+                f"{stage1_a0_label}_"
+                f"LoRA-r{self.lora_r}-Alpha-{self.lora_alpha}-"
+                f"Dropout-{self.lora_dropout:g}_"
                 f"Seed-{self.stage1_seed}"
             )
+
 
         elif self.ablation_id == "A1":
             stage1_a1_label = "A1-NoDLR"
@@ -569,13 +575,18 @@ class Stage2TrainConfig:
         # 将 Stage 1 数据来源和 Conv2D 结构都写进目录名，
         # -----------------------------------------------------
         if self.ablation_id == "A0":
+            stage2_a0_label = "A0-LoRAOnly-NoDLR"
+
             stage2_experiment_dir = (
                 f"Stage2_SLAKE_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A0_LoRAOnly_"
+                f"{stage2_a0_label}_"
+                f"LoRA-r{self.lora_r}-Alpha-{self.lora_alpha}-"
+                f"Dropout-{self.lora_dropout:g}_"
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
             )
+
 
         elif self.ablation_id == "A1":
             stage2_a1_label = "A1-NoDLR"

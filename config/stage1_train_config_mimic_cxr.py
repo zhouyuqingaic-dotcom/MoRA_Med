@@ -10,8 +10,10 @@ class TrainConfig:
     对应 RoMA-Net V2-lite 消融体系：
 
     A0:
-        Qwen3-VL + LoRA
+        Pure LoRA baseline
+
         enable_visual_adapter=False
+        use_discriminative_lr=False
 
     A1:
         w/o DLR
@@ -106,7 +108,7 @@ class TrainConfig:
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A1" #"A2" #"A3" #"A4" #"A5" #"A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    ablation_id: str = "A0" #"A1" #"A2" #"A3" #"A4" #"A5" #"A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
@@ -329,19 +331,10 @@ class TrainConfig:
             # Qwen3-VL + LoRA
             # 不启用 RoMA-Net visual adapter。
             # -------------------------------------------------
-            self.enable_visual_adapter = False
 
-            # 以下配置在 A0 中不会被真正使用。
-            # 保留合法值是为了统一日志输出和配置检查。
-            self.scale_mode = "learned"
-
-            self.gate_mode = "fixed"
-            self.fixed_gate = 1.0
-
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 0.0
-
-            self.use_rms_norm = False
+            # Pure LoRA baseline
+            self.enable_visual_adapter = False #关闭视觉适配器
+            self.use_discriminative_lr = False
 
         elif aid == "A1":
             # -------------------------------------------------
@@ -542,11 +535,15 @@ class TrainConfig:
         # 4. 输出目录
         # =====================================================
         if self.ablation_id == "A0":
-            # 纯 LoRA baseline，不包含视觉适配器、Router、Gate 和 Lambda。
+            # 纯 LoRA baseline，不包含视觉适配器
+            a0_label = "A0-LoRAOnly-NoDLR"
+
             experiment_name = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.mimic_cxr_cache_prefix}_"
-                f"A0_LoRAOnly_"
+                f"{a0_label}_"
+                f"LoRA-r{self.lora_r}-Alpha-{self.lora_alpha}-"
+                f"Dropout-{self.lora_dropout:g}_"
                 f"Seed-{self.seed}"
             )
 
