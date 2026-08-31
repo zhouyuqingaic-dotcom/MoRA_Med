@@ -30,7 +30,7 @@ class Stage2EvalConfig(Stage2TrainConfig):
     # 必须对应要评测的 Stage 2 实验
     ablation_id: str = "A0" #"A1" #"A2" #"A3" #"A4" #"A5" #"A6" #"A0" #"A0" #"A5"
 
-    # 当前评测 A6-DLR。
+    # 当前评测 A6
     # use_discriminative_lr: bool = True
     # stage1_use_discriminative_lr: bool = True
     #为A0,A1择为False
@@ -38,10 +38,10 @@ class Stage2EvalConfig(Stage2TrainConfig):
     stage1_use_discriminative_lr: bool = False
 
     # Stage 2 训练种子
-    seed: int = 2048
+    seed: int = 1024 #4096 #1024 #4096 #1024 #2048
 
     # Stage 1 来源权重的种子
-    stage1_seed: int = 2048
+    stage1_seed: int = 1024 #4096 #1024 #4096 #1024 #2048
 
     # True: 只评测 final_weights
     # False: 评测 checkpoint-* 和 final_weights

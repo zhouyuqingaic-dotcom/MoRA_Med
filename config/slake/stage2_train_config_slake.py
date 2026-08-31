@@ -20,11 +20,13 @@ class Stage2TrainConfig:
     # =========================================================
     print_rank: int = 0
 
-    # Stage 2 的随机种子
-    seed: int = 2048
+    # Stage 2 的随机种子,必须和stage1一致
+    # seed: int = 2048
+    seed: int = 1024 #4096
 
     # Stage 1 训练时使用的随机种子，用于推导权重目录
-    stage1_seed: int = 2048
+    # stage1_seed: int = 2048
+    stage1_seed: int = 1024 #4096
 
     # Stage 1 使用的 MIMIC-CXR 数据缓存前缀。
     # 必须与 Stage 1 TrainConfig 中的 mimic_cxr_cache_prefix 完全一致。
@@ -40,7 +42,7 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A0" #"A1" #"A2" #"A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
+    ablation_id: str = "A6" #"A1" #"A2" #"A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 

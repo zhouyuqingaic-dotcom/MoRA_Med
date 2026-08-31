@@ -2,6 +2,33 @@ from dataclasses import dataclass, field
 from typing import Optional
 from utils.ddp.ddp_utils import ddp_print
 
+#获取命令行参数
+import argparse
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--ablation_id",
+        type=str,
+        default="A0",
+        choices=["A0", "A1", "A2", "A3", "A4", "A5", "A6"],
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2048,
+    )
+
+    # config 可能被 torchrun / 其他脚本 import，
+    # 所以忽略当前 config 不认识的额外参数
+    args, _ = parser.parse_known_args()
+
+    return args
+#执行参数获取
+_cli_args=parse_args()
+
+
 @dataclass
 class TrainConfig:
     """
@@ -104,11 +131,16 @@ class TrainConfig:
     # 1. 基础配置
     # =========================================================
     print_rank: int = 0
-    seed: int = 2048
+    #可以设置默认
+    # seed: int = 2048
+    #也可以获取命令行参数
+    seed: int=getattr(_cli_args, "seed",2048)
 
     # 当前消融实验 ID
     # 可选: "A0", "A1", "A2", "A3", "A4", "A5"
-    ablation_id: str = "A0" #"A1" #"A2" #"A3" #"A4" #"A5" #"A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    # ablation_id: str = "A0" #"A1" #"A2" #"A3" #"A4" #"A5" #"A6" #"A6" #"A0" #"A5" #"A5" #"A5" #"A4" #"A3" #"A2" #"A1" "A0"
+    #也可以获取命令行参数
+    ablation_id: str =getattr(_cli_args, "ablation_id","A0")
 
     # 统一输出根目录
     output_root: str = "/home/yuqing/Models/MoRA_Med"
