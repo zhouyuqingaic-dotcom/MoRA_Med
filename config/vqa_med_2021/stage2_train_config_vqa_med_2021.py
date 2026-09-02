@@ -7,6 +7,37 @@ from typing import Optional
 
 from utils.ddp.ddp_utils import ddp_print
 
+#获取命令行参数
+import argparse
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--ablation_id",
+        type=str,
+        default="A0",
+        choices=["A0", "A1", "A2", "A3", "A4", "A5", "A6"],
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2048,
+    )
+
+    parser.add_argument(
+        "--stage1_seed",
+        type=int,
+        default=2048,
+    )
+
+    # config 可能被 torchrun / 其他脚本 import，
+    # 所以忽略当前 config 不认识的额外参数
+    args, _ = parser.parse_known_args()
+
+    return args
+#执行参数获取
+_cli_args=parse_args()
 
 @dataclass
 class Stage2TrainConfig:
@@ -30,10 +61,14 @@ class Stage2TrainConfig:
     print_rank: int = 0
 
     # Stage 2 随机种子。
-    seed: int = 2048
+    # seed: int = 2048
+    # 也可以获取命令行参数
+    seed: int = getattr(_cli_args, "seed", 2048)
 
     # Stage 1 来源权重的随机种子。
-    stage1_seed: int = 2048
+    # stage1_seed: int = 2048
+    # 也可以获取命令行参数
+    stage1_seed: int = getattr(_cli_args, "stage1_seed", 2048)
 
     # 必须与 Stage 1 TrainConfig 中的缓存前缀完全一致。
     stage1_mimic_cxr_cache_prefix: str = (
@@ -44,7 +79,9 @@ class Stage2TrainConfig:
     # 常用：
     #   A0：LoRA-only baseline
     #   A6：MoRA 强视觉残差版本
-    ablation_id: str = "A0" #"A6" #"A0"
+    # ablation_id: str = "A0" #"A6" #"A0"
+    # 也可以获取命令行参数
+    ablation_id: str = getattr(_cli_args, "ablation_id", "A0")
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -144,10 +181,11 @@ class Stage2TrainConfig:
     #   global batch = 4 GPUs × 4 samples × 1 accumulation = 16
     #
     # 双卡若希望保持相同 global batch，可改为：
-    #   per_device_train_batch_size = 4
-    #   gradient_accumulation_steps = 2
-    per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 1
+    per_device_train_batch_size = 4
+    gradient_accumulation_steps = 2
+    # #4卡状态
+    # per_device_train_batch_size: int = 4
+    # gradient_accumulation_steps: int = 1
 
     num_train_epochs: float = 3.0
 
@@ -209,14 +247,14 @@ class Stage2TrainConfig:
 
     # 样本级 residual gate。
     gate_mode: str = "learned"
-    fixed_gate: float = 1.0
+    fixed_gate: float = 0.5
     gate_init: float = 0.5
 
     # 全局残差系数 lambda。
     lambda_mode: str = "learnable"
-    fixed_lambda: float = 0.1
+    fixed_lambda: float = 0.9
+    lambda_init: float = 0.9
     lambda_max: float = 1.0
-    lambda_init: float = 0.1
 
     # 视觉残差 RMS 对齐。
     use_rms_norm: bool = True
@@ -335,14 +373,10 @@ class Stage2TrainConfig:
         self.ablation_id = aid
 
         if aid == "A0":
+            # Pure Qwen3-VL + LoRA baseline
             self.enable_visual_adapter = False
-            self.scale_mode = "learned"
-            self.gate_mode = "fixed"
-            self.fixed_gate = 1.0
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 0.0
-            self.use_rms_norm = False
 
+            # A0 不使用 DLR
             self.use_discriminative_lr = False
             self.stage1_use_discriminative_lr = False
 
@@ -407,23 +441,19 @@ class Stage2TrainConfig:
             self.stage1_use_discriminative_lr = False
 
         elif aid == "A6":
-            # 强视觉残差注入实验：
-            # effective residual scale = fixed_lambda × gate
+            # Full MoRA-Med
             self.enable_visual_adapter = True
+            # Dynamic multi-scale routing
             self.scale_mode = "learned"
-
+            # Adaptive gate
             self.gate_mode = "learned"
-            self.gate_init = 0.5
-
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 1.0
-
+            # Learnable global residual scale
+            self.lambda_mode = "learnable"
+            # RMS Matching
             self.use_rms_norm = True
-
-            # A6 是否使用 DLR，由用户配置的两个开关决定。
-            # 不在这里强制覆盖：
-            #   use_discriminative_lr
-            #   stage1_use_discriminative_lr
+            # DLR
+            self.use_discriminative_lr = True
+            self.stage1_use_discriminative_lr = True
 
         else:
             raise ValueError(
@@ -482,10 +512,14 @@ class Stage2TrainConfig:
     # =========================================================
     def _build_stage1_weights_dir(self) -> None:
         if self.ablation_id == "A0":
+            stage1_a0_label = "A0-LoRAOnly-NoDLR"
+
             stage1_experiment_dir = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A0_LoRAOnly_"
+                f"{stage1_a0_label}_"
+                f"LoRA-r{self.lora_r}-Alpha-{self.lora_alpha}-"
+                f"Dropout-{self.lora_dropout:g}_"
                 f"Seed-{self.stage1_seed}"
             )
 
@@ -496,6 +530,15 @@ class Stage2TrainConfig:
                 else "A6"
             )
 
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
             stage1_experiment_dir = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
@@ -503,7 +546,7 @@ class Stage2TrainConfig:
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
-                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
                 f"Seed-{self.stage1_seed}"
             )
@@ -532,10 +575,14 @@ class Stage2TrainConfig:
     # =========================================================
     def _build_stage2_output_dir(self) -> None:
         if self.ablation_id == "A0":
+            stage2_a0_label = "A0-LoRAOnly-NoDLR"
+
             self.stage2_experiment_dir = (
                 f"Stage2_VQA_MED_2021_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A0_LoRAOnly_"
+                f"{stage2_a0_label}_"
+                f"LoRA-r{self.lora_r}-Alpha-{self.lora_alpha}-"
+                f"Dropout-{self.lora_dropout:g}_"
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
             )
@@ -547,6 +594,16 @@ class Stage2TrainConfig:
                 else "A6"
             )
 
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
             self.stage2_experiment_dir = (
                 f"Stage2_VQA_MED_2021_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
@@ -554,7 +611,7 @@ class Stage2TrainConfig:
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
-                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
