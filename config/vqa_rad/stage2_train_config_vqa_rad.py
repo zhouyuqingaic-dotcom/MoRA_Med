@@ -3,6 +3,38 @@ from dataclasses import dataclass, field
 from typing import Optional
 from utils.ddp.ddp_utils import ddp_print
 
+#获取命令行参数
+import argparse
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--ablation_id",
+        type=str,
+        default="A0",
+        choices=["A0", "A1", "A2", "A3", "A4", "A5", "A6"],
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2048,
+    )
+
+    parser.add_argument(
+        "--stage1_seed",
+        type=int,
+        default=2048,
+    )
+
+    # config 可能被 torchrun / 其他脚本 import，
+    # 所以忽略当前 config 不认识的额外参数
+    args, _ = parser.parse_known_args()
+
+    return args
+#执行参数获取
+_cli_args=parse_args()
+
 @dataclass
 class Stage2TrainConfig:
     """
@@ -21,10 +53,14 @@ class Stage2TrainConfig:
     print_rank: int = 0
 
     # Stage 2 的随机种子
-    seed: int = 2048
+    # seed: int = 2048
+    # 也可以获取命令行参数
+    seed: int = getattr(_cli_args, "seed", 2048)
 
     # Stage 1 训练时使用的随机种子，用于推导权重目录
-    stage1_seed: int = 2048
+    # stage1_seed: int = 2048
+    # 也可以获取命令行参数
+    stage1_seed: int = getattr(_cli_args, "stage1_seed", 2048)
 
     # Stage 1 使用的 MIMIC-CXR 数据缓存前缀。
     # 必须与 Stage 1 TrainConfig 中的 mimic_cxr_cache_prefix 完全一致。
@@ -40,7 +76,9 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A6" #"A0" #"A6" #"A6" #"A0" #"A5"
+    # ablation_id: str = "A6" #"A0" #"A6" #"A6" #"A0" #"A5"
+    # 也可以获取命令行参数
+    ablation_id: str = getattr(_cli_args, "ablation_id", "A0")
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -121,11 +159,11 @@ class Stage2TrainConfig:
     # =========================================================
     #重要，一定要根据卡数量调整，这回改变参数更新次数
     ## 双卡：
-    # per_device_train_batch_size = 4
-    # gradient_accumulation_steps = 2
-    #四卡：
     per_device_train_batch_size = 1
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 2
+    #四卡：
+    # per_device_train_batch_size = 1
+    # gradient_accumulation_steps = 1
 
     #小数据集VQA-RAD改成10
     num_train_epochs: float = 10.0
@@ -190,13 +228,13 @@ class Stage2TrainConfig:
     )
 
     gate_mode: str = "learned"
-    fixed_gate: float = 1.0
+    fixed_gate: float = 0.5
     gate_init: float = 0.5
 
     lambda_mode: str = "learnable"
-    fixed_lambda: float = 0.1
+    fixed_lambda: float = 0.9
+    lambda_init: float = 0.9
     lambda_max: float = 1.0
-    lambda_init: float = 0.1
 
     use_rms_norm: bool = True
     residual_norm_eps: float = 1e-6
@@ -216,14 +254,10 @@ class Stage2TrainConfig:
         # 必须与 Stage 1 TrainConfig 的消融定义完全相同
         # -----------------------------------------------------
         if aid == "A0":
+            # Pure Qwen3-VL + LoRA baseline
             self.enable_visual_adapter = False
-            self.scale_mode = "learned"
-            self.gate_mode = "fixed"
-            self.fixed_gate = 1.0
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 0.0
-            self.use_rms_norm = False
 
+            # A0 不使用 DLR
             self.use_discriminative_lr = False
             self.stage1_use_discriminative_lr = False
 
@@ -288,31 +322,19 @@ class Stage2TrainConfig:
             self.stage1_use_discriminative_lr = False
 
         elif aid == "A6":
-            # -------------------------------------------------
-            # 强视觉残差注入实验。
-            #
-            # effective residual scale = fixed_lambda * gate
-            # Stage 1 初始约为：
-            # 1.0 * 0.5 = 0.5
-            #
-            # Stage 2 会继承 Stage 1 已训练的 Gate 参数，
-            # gate_init 主要用于保持结构与配置语义一致。
-            # -------------------------------------------------
+            # Full MoRA-Med
             self.enable_visual_adapter = True
-
-            # BioMedCLIP-conditioned F3/F5/F7 动态路由
+            # Dynamic multi-scale routing
             self.scale_mode = "learned"
-
-            # 样本级 residual gate
+            # Adaptive gate
             self.gate_mode = "learned"
-            self.gate_init = 0.5
-
-            # 固定 lambda=1.0
-            self.lambda_mode = "fixed"
-            self.fixed_lambda = 1.0
-
-            # 保留 residual RMS normalization
+            # Learnable global residual scale
+            self.lambda_mode = "learnable"
+            # RMS Matching
             self.use_rms_norm = True
+            # DLR
+            self.use_discriminative_lr = True
+            self.stage1_use_discriminative_lr = True
 
         else:
             raise ValueError(
@@ -325,12 +347,17 @@ class Stage2TrainConfig:
         # 必须与 Stage 1 TrainConfig 的命名规则完全一致。
         # -----------------------------------------------------
         if self.ablation_id == "A0":
+            stage1_a0_label = "A0-LoRAOnly-NoDLR"
+
             stage1_experiment_dir = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A0_LoRAOnly_"
+                f"{stage1_a0_label}_"
+                f"LoRA-r{self.lora_r}-Alpha-{self.lora_alpha}-"
+                f"Dropout-{self.lora_dropout:g}_"
                 f"Seed-{self.stage1_seed}"
             )
+
 
         elif self.ablation_id == "A6":
             stage1_a6_label = (
@@ -339,6 +366,16 @@ class Stage2TrainConfig:
                 else "A6"
             )
 
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
             stage1_experiment_dir = (
                 f"Stage1_MIMIC_CXR_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
@@ -346,7 +383,7 @@ class Stage2TrainConfig:
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
-                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
                 f"Seed-{self.stage1_seed}"
             )
@@ -375,13 +412,18 @@ class Stage2TrainConfig:
         # 将 Stage 1 数据来源和 Conv2D 结构都写进目录名，
         # -----------------------------------------------------
         if self.ablation_id == "A0":
+            stage2_a0_label = "A0-LoRAOnly-NoDLR"
+
             stage2_experiment_dir = (
                 f"Stage2_VQA_RAD_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
-                f"A0_LoRAOnly_"
+                f"{stage2_a0_label}_"
+                f"LoRA-r{self.lora_r}-Alpha-{self.lora_alpha}-"
+                f"Dropout-{self.lora_dropout:g}_"
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
             )
+
 
         elif self.ablation_id == "A6":
             stage2_a6_label = (
@@ -390,6 +432,16 @@ class Stage2TrainConfig:
                 else "A6"
             )
 
+            if self.lambda_mode == "learnable":
+                lambda_label = (
+                    f"Lambda-learnable-Init-{self.lambda_init:g}"
+                    f"-Max-{self.lambda_max:g}"
+                )
+            else:
+                lambda_label = (
+                    f"Lambda-fixed-{self.fixed_lambda:g}"
+                )
+
             stage2_experiment_dir = (
                 f"Stage2_VQA_RAD_"
                 f"{self.stage1_mimic_cxr_cache_prefix}_"
@@ -397,7 +449,7 @@ class Stage2TrainConfig:
                 f"Experts-Conv2D-F3_F5_F7_"
                 f"Scale-{self.scale_mode}_"
                 f"Gate-{self.gate_mode}-Init-{self.gate_init:g}_"
-                f"Lambda-fixed-{self.fixed_lambda:g}_"
+                f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"

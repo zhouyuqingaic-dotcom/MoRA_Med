@@ -1,4 +1,9 @@
 import os
+
+#解决网络不通
+os.environ["http_proxy"]="http://10.110.248.29:7897"
+os.environ["https_proxy"]="http://10.110.248.29:7897"
+
 from dataclasses import dataclass
 
 from config.vqa_med_2019.stage2_train_config_vqa_med_2019 import (
@@ -37,13 +42,13 @@ class Stage2EvalConfig(Stage2TrainConfig):
     # =========================================================
 
     # A6 + 两个 DLR 开关为 True，对应 A6-DLR。
-    ablation_id: str = "A6" #"A0" #"A6"
+    ablation_id: str = "A6" #"A6" #"A0" #"A6"
 
     # Stage 2 训练随机种子。
-    seed: int = 2048
+    seed: int = 4096 #2048 #1024 #2048
 
     # Stage 1 来源权重的随机种子。
-    stage1_seed: int = 2048
+    stage1_seed: int = 4096 #2048 #1024 #2048
 
     # 当前评测 A6-DLR。
     # 若评测普通 A6，将这两个字段改为 False。

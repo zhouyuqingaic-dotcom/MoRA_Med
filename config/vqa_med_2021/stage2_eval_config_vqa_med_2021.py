@@ -1,4 +1,9 @@
 import os
+
+#解决网络不通
+os.environ["http_proxy"]="http://10.110.248.29:7897"
+os.environ["https_proxy"]="http://10.110.248.29:7897"
+
 from dataclasses import dataclass
 
 from config.vqa_med_2021.stage2_train_config_vqa_med_2021 import (
@@ -45,18 +50,18 @@ class Stage2EvalConfig(Stage2TrainConfig):
     # 常用：
     #   "A0"：LoRA-only baseline
     #   "A6"：MoRA 强视觉残差
-    ablation_id: str = "A0" #"A6" #"A0"  # "A6"
+    ablation_id: str = "A0" #"A6" #"A0" #"A6" #"A0"  # "A6"
 
     # Stage 2 训练随机种子。
-    seed: int = 2048
+    seed: int = 4096 #2048 #1024 #2048 #1024 #2048 #4096 #2048 #1024 #2048
 
     # Stage 1 来源权重随机种子。
-    stage1_seed: int = 2048
+    stage1_seed: int = 4096 #2048 #1024 #2048 #1024 #2048 #4096 #2048 #1024 #2048
 
     # 评测 A6-DLR 时，将以下两个字段改为 True。
     # 普通 A0 / A6 保持 False。
-    use_discriminative_lr: bool = False
-    stage1_use_discriminative_lr: bool = False
+    use_discriminative_lr: bool = False #True
+    stage1_use_discriminative_lr: bool = False #True
 
     # =========================================================
     # 2. 评测输出

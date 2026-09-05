@@ -30,7 +30,7 @@ class Stage2EvalConfig(Stage2TrainConfig):
     # =========================================================
 
     # 主实验：A6-DLR
-    ablation_id: str = "A6" #"A0" #"A6" #"A0"
+    ablation_id: str = "A0" #"A6" #"A0"
 
     # Stage 2 训练时使用的 seed
     seed: int = 2048
@@ -45,18 +45,18 @@ class Stage2EvalConfig(Stage2TrainConfig):
 
     # True：只评测 final_weights
     # False：评测 checkpoint-*，并在最后评测 final_weights
-    eval_final_weights_only: bool = False
+    eval_final_weights_only: bool = True #False
 
     # Stage 2 是否为 DLR 实验。
     # 评测阶段不会创建优化器，但该字段决定 Stage 2 目录名称。
     #A0为False
-    use_discriminative_lr: bool = True
+    use_discriminative_lr: bool = False #True
     lr_recipe_name: str = "DLR"
 
     # 所加载的 Stage 1 是否为 DLR 实验。
     # 必须与真实 Stage 1 checkpoint 目录一致。
     #A0为False
-    stage1_use_discriminative_lr: bool = True
+    stage1_use_discriminative_lr: bool = False #True
     stage1_lr_recipe_name: str = "DLR"
 
     # =========================================================
