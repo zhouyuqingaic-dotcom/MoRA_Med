@@ -171,6 +171,8 @@ The repository contains the controlled A0-A6 ablation family used in the paper:
 
 ```text
 MoRA_Med/
+├── README.md
+├── requirements.txt
 ├── figures/
 │   ├── framework.png
 │   ├── framerwork_detail.png
@@ -230,21 +232,29 @@ git clone <YOUR_REPOSITORY_URL>
 cd MoRA_Med
 ```
 
-### 2. Create an environment
+### 2. Create the Python environment
 
-The repository does not yet pin exact package versions. The current code depends on PyTorch/Hugging Face PEFT tooling, bitsandbytes quantization, OpenCLIP, and FlashAttention.
-
-A minimal starting point is:
+The experiments reported in the paper were run with **Python 3.11.15**.
 
 ```bash
-pip install \
-  torch torchvision \
-  transformers accelerate peft \
-  bitsandbytes safetensors \
-  open-clip-torch \
-  pillow numpy tqdm \
-  openai requests
+conda create -n mora-med python=3.11.15 -y
+conda activate mora-med
+python -m pip install --upgrade pip
 ```
+
+### 3. Install the CUDA-enabled PyTorch build
+
+The reference environment uses **PyTorch 2.10.0+cu130** and
+**torchvision 0.25.0+cu130**:
+
+```bash
+python -m pip install \
+  torch==2.10.0+cu130 \
+  torchvision==0.25.0+cu130 \
+  --index-url https://download.pytorch.org/whl/cu130
+```
+
+### 4. Install FlashAttention
 
 The default Qwen3-VL configuration uses:
 
@@ -252,15 +262,52 @@ The default Qwen3-VL configuration uses:
 attn_implementation = "flash_attention_2"
 ```
 
-Install FlashAttention if your CUDA/PyTorch environment supports it:
+Install the same FlashAttention version used in the reference environment
+after PyTorch is available:
 
 ```bash
-pip install flash-attn --no-build-isolation
+python -m pip install flash-attn==2.8.3 --no-build-isolation
 ```
 
-If FlashAttention is unavailable, change `attn_implementation` in the corresponding config file to a supported alternative such as `sdpa` or `eager`.
+### 5. Install the remaining dependencies
 
-> Before the public release, we recommend adding a pinned `requirements.txt` or `environment.yml` generated from the final reproducibility environment.
+```bash
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` pins the main runtime dependencies used by this release.
+In particular, the Transformers dependency is pinned to the exact development
+commit used in the experiments:
+
+```text
+ca960f0cc0d2c2549b0f1834a51fa91230e50134
+```
+
+Because this dependency is installed directly from the Hugging Face
+Transformers Git repository, `git` must be available in the environment.
+
+### Reference experiment environment
+
+| Component | Version / configuration |
+|---|---|
+| Python | 3.11.15 |
+| PyTorch | 2.10.0+cu130 |
+| PyTorch CUDA runtime | 13.0 |
+| torchvision | 0.25.0+cu130 |
+| NVIDIA driver | 580.173.02 |
+| GPU used for the reported experiments | 2 × NVIDIA A40 (48 GB each) |
+| Transformers | 5.3.0.dev0 |
+| Transformers commit | `ca960f0cc0d2c2549b0f1834a51fa91230e50134` |
+| Accelerate | 1.13.0 |
+| PEFT | 0.18.1 |
+| bitsandbytes | 0.49.2 |
+| FlashAttention | 2.8.3 |
+| OpenCLIP | 2.23.0 |
+
+For the closest reproduction of the reported experiments, use the pinned
+environment above. If FlashAttention is unavailable, another supported
+attention implementation such as `sdpa` or `eager` may allow the code to run,
+but that is not the exact reference environment used for the reported results.
 
 ## Model Preparation
 
@@ -412,7 +459,7 @@ At minimum, verify:
 
 The training scripts are compatible with Hugging Face `Trainer` and are written to support distributed execution through `torchrun`.
 
-Replace `<N>` with the number of GPUs to use.
+Replace `<N>` with the number of GPUs to use. The experiments reported in the paper used **2 GPUs**, i.e. `--nproc_per_node=2`.
 
 ### Stage 1: MIMIC-CXR
 
