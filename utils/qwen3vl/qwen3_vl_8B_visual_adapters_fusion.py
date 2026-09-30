@@ -8,6 +8,7 @@ from utils.qwen3vl.qwen3_vl_8B_visual_adapters_fusion_utils import (
     build_biomedclip_route_features,
     compute_bounded_lambda,
     rms_normalize_residual,
+    compute_rms_match_statistics,
 )
 
 
@@ -156,6 +157,16 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
 
         # 冻结当前消融模式中不会参与训练的分支。
         self._freeze_disabled_branches()
+
+        # ---------------------------------------------------------
+        # Evaluation-only diagnostics.
+        #
+        # 这些字段不注册为 parameter / buffer，
+        # 不进入 state_dict，不影响旧 checkpoint 兼容性。
+        # 默认关闭，因此正常训练和正常评测不会增加额外统计开销。
+        # ---------------------------------------------------------
+        self.diagnostics_enabled = False
+        self.diagnostic_records = []
 
     def _validate_modes(self):
         if self.scale_mode not in {
@@ -316,12 +327,67 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
             dtype=x.dtype,
         )
 
+    def enable_diagnostics(
+        self,
+        enabled: bool = True,
+    ):
+        """
+        开启 / 关闭推理期诊断。
+
+        默认关闭。
+        关闭时同时清空旧记录，避免不同评测条件之间串数据。
+        """
+        self.diagnostics_enabled = bool(
+            enabled
+        )
+
+        if not self.diagnostics_enabled:
+            self.reset_diagnostics()
+
+    def reset_diagnostics(self):
+        """
+        清空当前累计的诊断记录。
+        建议每个 evaluation batch 开始前调用一次。
+        """
+        self.diagnostic_records = []
+
+    def pop_diagnostics(self) -> list[dict]:
+        """
+        取出并清空当前累计的诊断记录。
+        """
+        records = self.diagnostic_records
+        self.diagnostic_records = []
+        return records
+
+    @staticmethod
+    def _compute_plain_rms(
+        tensor: torch.Tensor,
+    ) -> float:
+        """
+        用于描述实际 tensor 幅值的 RMS。
+
+        注意：
+        这里只用于日志，不参与模型计算；
+        不加入 residual_norm_eps，避免改变其物理解释。
+        """
+        value = tensor.detach().float()
+
+        rms = torch.sqrt(
+            torch.mean(
+                value.square()
+            )
+        )
+
+        return float(rms.item())
+
     def forward(
         self,
         x: torch.Tensor,
         biomed_img_feat: torch.Tensor,
         biomed_txt_feat: torch.Tensor,
         grid_thw: torch.Tensor,
+        router_txt_feat: torch.Tensor | None = None,
+        stream_name: str | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -337,8 +403,31 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
                 第一维必须对应图片数量。
 
             biomed_txt_feat:
-                BioMedCLIP 问题文本特征。
+                BioMedCLIP 原始正确问题的文本特征。
                 第一维必须对应图片数量。
+
+            router_txt_feat:
+                可选的 Router-only 文本特征。
+
+                None:
+                    Router 和 Gate 都使用 biomed_txt_feat，
+                    与原始实现保持一致。
+
+                非 None:
+                    仅 Router 使用 router_txt_feat；
+                    Gate 仍然使用 biomed_txt_feat。
+
+                该参数仅用于评测阶段的问题置换诊断。
+
+            stream_name:
+                当前视觉特征流名称，仅用于诊断记录。
+
+                例如：
+                    "pooled"
+                    "deepstack_0"
+                    "deepstack_1"
+
+                不参与模型计算。
 
             grid_thw:
                 每张图片对应的原始 Qwen 视觉网格。
@@ -355,6 +444,42 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
                 "动态融合模式下，必须传入 "
                 "biomed_img_feat 和 biomed_txt_feat。"
             )
+
+        # Router-only question intervention:
+        # 仅允许在 learned routing 的评测阶段使用。
+        if router_txt_feat is not None:
+            if self.training:
+                raise RuntimeError(
+                    "router_txt_feat 仅用于评测阶段的 "
+                    "Router-only intervention。"
+                    "请先调用 model.eval()。"
+                )
+
+            if self.scale_mode != "learned":
+                raise ValueError(
+                    "router_txt_feat 只适用于 "
+                    "scale_mode='learned'。"
+                )
+
+            if (
+                router_txt_feat.shape
+                != biomed_txt_feat.shape
+            ):
+                raise ValueError(
+                    "router_txt_feat 与 biomed_txt_feat "
+                    "shape 必须一致："
+                    f"router={tuple(router_txt_feat.shape)}, "
+                    f"original={tuple(biomed_txt_feat.shape)}"
+                )
+
+            if (
+                router_txt_feat.device
+                != biomed_txt_feat.device
+            ):
+                raise ValueError(
+                    "router_txt_feat 与 biomed_txt_feat "
+                    "必须位于同一 device。"
+                )
 
         if grid_thw is None:
             raise ValueError(
@@ -374,7 +499,14 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
                 f"当前 shape={tuple(x.shape)}"
             )
 
-        route_features = (
+        # ---------------------------------------------------------
+        # Original image-question prior.
+        #
+        # Gate 永远由正确的问题条件控制。
+        # 正常模式下 Router 也直接复用这个 hidden，
+        # 从而保持与旧代码相同的计算路径。
+        # ---------------------------------------------------------
+        original_route_features = (
             build_biomedclip_route_features(
                 biomed_img_feat=biomed_img_feat,
                 biomed_txt_feat=biomed_txt_feat,
@@ -384,20 +516,57 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
             )
         )
 
-        route_hidden = self.router_backbone(
-            route_features
+        original_route_hidden = (
+            self.router_backbone(
+                original_route_features
+            )
         )
+
+        # Gate 始终使用原始正确问题。
+        soft_gate = self._get_soft_gate(
+            original_route_hidden
+        )
+
+        # ---------------------------------------------------------
+        # Router input.
+        #
+        # Normal:
+        #     Router(I, Q)
+        #
+        # Router-only shuffle:
+        #     Router(I, Q_shuffle)
+        #
+        # 图像始终保持为当前样本的原图。
+        # ---------------------------------------------------------
+        if router_txt_feat is None:
+            scale_route_hidden = (
+                original_route_hidden
+            )
+        else:
+            shuffled_route_features = (
+                build_biomedclip_route_features(
+                    biomed_img_feat=biomed_img_feat,
+                    biomed_txt_feat=router_txt_feat,
+                    use_cross_modal_prior=(
+                        self.use_cross_modal_prior
+                    ),
+                )
+            )
+
+            scale_route_hidden = (
+                self.router_backbone(
+                    shuffled_route_features
+                )
+            )
 
         # scale_weights:
         #   [:, 0] -> F3
         #   [:, 1] -> F5
         #   [:, 2] -> F7
-        scale_weights = self._get_scale_weights(
-            route_hidden
-        )
-
-        soft_gate = self._get_soft_gate(
-            route_hidden
+        scale_weights = (
+            self._get_scale_weights(
+                scale_route_hidden
+            )
         )
 
         lambda_value = self._get_lambda(
@@ -488,29 +657,222 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
                 grid_shape,
             )
 
-            # Question-conditioned 三尺度动态融合。
-            residual = (
+            # -----------------------------------------------------
+            # Question-conditioned 三尺度残差融合。
+            #
+            # raw_residual:
+            #     RMS Matching 之前的原始 routed residual。
+            # -----------------------------------------------------
+            raw_residual = (
                 w3 * res3
                 + w5 * res5
                 + w7 * res7
             )
 
+            # used_residual:
+            #     真正进入 residual injection 的 residual。
+            #
+            # A2 / no-RMS:
+            #     used_residual == raw_residual
+            #
+            # A6 / RMS:
+            #     used_residual == RMS-matched residual
+            used_residual = raw_residual
+
             if self.use_rms_norm:
-                residual = rms_normalize_residual(
-                    x=sub_x,
-                    residual=residual,
-                    eps=self.residual_norm_eps,
-                    ratio_clip=(
-                        self.residual_norm_ratio_clip
-                    ),
+                used_residual = (
+                    rms_normalize_residual(
+                        x=sub_x,
+                        residual=raw_residual,
+                        eps=self.residual_norm_eps,
+                        ratio_clip=(
+                            self.residual_norm_ratio_clip
+                        ),
+                    )
                 )
+
+            # 真正注入原视觉特征的 residual update。
+            delta = (
+                lambda_value
+                * gate
+                * used_residual
+            )
 
             sub_out = (
                 sub_x
-                + lambda_value
-                * gate
-                * residual
+                + delta
             )
+
+            # -----------------------------------------------------
+            # Evaluation-only diagnostics.
+            #
+            # 这里只记录 detached scalar，
+            # 不改变模型计算，也不保存完整 tensor。
+            # -----------------------------------------------------
+            if self.diagnostics_enabled:
+                rms_x = (
+                    self._compute_plain_rms(
+                        sub_x
+                    )
+                )
+
+                rms_raw = (
+                    self._compute_plain_rms(
+                        raw_residual
+                    )
+                )
+
+                rms_used = (
+                    self._compute_plain_rms(
+                        used_residual
+                    )
+                )
+
+                rms_delta = (
+                    self._compute_plain_rms(
+                        delta
+                    )
+                )
+
+                # -------------------------------------------------
+                # RMS Matching internal statistics.
+                #
+                # 只在模型实际启用 RMS Matching 时记录。
+                # 这里与 rms_normalize_residual() 共用同一套
+                # utils 数学实现，避免“模型算一套、日志算一套”。
+                #
+                # A2 / no-RMS:
+                #     rho_* = None
+                #
+                # A6 / RMS:
+                #     记录 unclipped / applied / clipped。
+                # -------------------------------------------------
+                if self.use_rms_norm:
+                    rms_match_stats = (
+                        compute_rms_match_statistics(
+                            x=sub_x,
+                            residual=raw_residual,
+                            eps=self.residual_norm_eps,
+                            ratio_clip=(
+                                self.residual_norm_ratio_clip
+                            ),
+                        )
+                    )
+
+                    rho_unclipped = float(
+                        rms_match_stats[
+                            "ratio_unclipped"
+                        ]
+                        .detach()
+                        .float()
+                        .reshape(-1)[0]
+                        .item()
+                    )
+
+                    rho_applied = float(
+                        rms_match_stats[
+                            "ratio_applied"
+                        ]
+                        .detach()
+                        .float()
+                        .reshape(-1)[0]
+                        .item()
+                    )
+
+                    rho_clipped = bool(
+                        rms_match_stats[
+                            "ratio_clipped"
+                        ]
+                        .detach()
+                        .reshape(-1)[0]
+                        .item()
+                    )
+                else:
+                    rho_unclipped = None
+                    rho_applied = None
+                    rho_clipped = None
+
+                # 防止极端情况下除以 0。
+                if rms_x > 0.0:
+                    ratio_raw = (
+                        rms_raw / rms_x
+                    )
+
+                    ratio_used = (
+                        rms_used / rms_x
+                    )
+
+                    ratio_inject = (
+                        rms_delta / rms_x
+                    )
+                else:
+                    ratio_raw = None
+                    ratio_used = None
+                    ratio_inject = None
+
+                self.diagnostic_records.append(
+                    {
+                        "visual_item_index": i,
+                        "stream_name": (
+                            stream_name
+                            if stream_name is not None
+                            else "unknown"
+                        ),
+                        "use_rms_norm": (
+                            self.use_rms_norm
+                        ),
+                        "rms_x": rms_x,
+                        "rms_raw": rms_raw,
+                        "rms_used": rms_used,
+                        "rms_delta": rms_delta,
+                        "ratio_raw": ratio_raw,
+                        "ratio_used": ratio_used,
+                        "ratio_inject": (
+                            ratio_inject
+                        ),
+
+                        # RMS Matching scaling diagnostics.
+                        # 对 no-RMS 消融（例如 A2）保持为 None，
+                        # 避免记录并不存在于实际模型路径中的“假想 rho”。
+                        "rho_unclipped": (
+                            rho_unclipped
+                        ),
+                        "rho_applied": (
+                            rho_applied
+                        ),
+                        "rho_clipped": (
+                            rho_clipped
+                        ),
+
+                        "routing_f3": float(
+                            w3.detach()
+                            .float()
+                            .item()
+                        ),
+                        "routing_f5": float(
+                            w5.detach()
+                            .float()
+                            .item()
+                        ),
+                        "routing_f7": float(
+                            w7.detach()
+                            .float()
+                            .item()
+                        ),
+                        "gate": float(
+                            gate.detach()
+                            .float()
+                            .reshape(-1)[0]
+                            .item()
+                        ),
+                        "lambda": float(
+                            lambda_value.detach()
+                            .float()
+                            .reshape(-1)[0]
+                            .item()
+                        ),
+                    }
+                )
 
             out_list.append(
                 sub_out

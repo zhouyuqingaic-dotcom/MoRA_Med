@@ -2,7 +2,7 @@
 
 # MoRA-Med
 
-### Question-Conditioned Multi-Scale Residual Adaptation for Medical Visual Question Answering
+### Scale-Calibrated Multi-Scale Residual Adaptation for Medical Visual Question Answering
 
 **MoRA-Med** = **Medical-oriented Routing and Residual Adaptation for Medical VQA**
 
@@ -24,7 +24,7 @@ Yuqing Zhou · Pengfei Xu · Qihui Sun · Feng Yan
 ## Overview
 
 **MoRA-Med** is a parameter-efficient framework for medical visual question answering (Med-VQA).  
-Instead of relying only on low-rank weight adaptation, MoRA-Med explicitly adapts the **frozen visual-token representation** of a pretrained multimodal large language model using lightweight, question-conditioned residual updates.
+Instead of relying only on low-rank weight adaptation, MoRA-Med explicitly adapts the **frozen visual-token representation** of a pretrained multimodal large language model using lightweight multi-scale residual updates with explicit residual-scale calibration. Image-question-conditioned routing and gating remain components of the implementation.
 
 The current implementation uses:
 
@@ -34,7 +34,7 @@ The current implementation uses:
 - Three multi-scale residual experts with **3×3, 5×5, and 7×7** depthwise convolutions.
 - A question-conditioned **Router** to adaptively combine the residual experts.
 - A sample-wise **Gate** and bounded learnable global scale to control residual injection.
-- **RMS residual matching** to stabilize the scale of the injected update.
+- **Capped RMS residual matching** to calibrate the routed residual scale under a bounded amplification factor.
 - A **two-stage adaptation strategy**: MIMIC-CXR pre-adaptation followed by downstream Med-VQA adaptation.
 
 <p align="center">
@@ -47,8 +47,8 @@ The current implementation uses:
 
 ## Highlights
 
-- **Question-conditioned visual adaptation.** The residual update depends on the current image-question pair rather than using a fixed visual transformation.
-- **Adaptive multi-scale routing.** Three receptive-field experts are softly combined through sample-specific routing weights.
+- **Multi-scale visual residual adaptation.** Lightweight residual experts explicitly modify frozen visual-token representations.
+- **Image-question-conditioned soft routing.** Three receptive-field experts are combined through sample-specific weights; weight variation alone does not establish an independent accuracy benefit.
 - **Controlled residual injection.** A learned Gate, bounded global scale, and RMS matching regulate how strongly the adapted residual modifies frozen visual tokens.
 - **Parameter efficiency.** The MoRA-Med visual branch adds **6.58M trainable parameters**, corresponding to only **3.77%** over the LoRA-only baseline.
 - **Paired multi-seed evaluation.** Experiments use seeds **1024, 2048, and 4096** under matched Stage-1/Stage-2 conditions.
@@ -96,12 +96,14 @@ The implementation uses a visual hidden dimension of **4096** and a bottleneck r
 
 ### 3. Adaptive routing, gating, and residual fusion
 
-The Router predicts sample-specific soft weights over F3/F5/F7. The routed residual is then stabilized with RMS residual matching and modulated by:
+The Router predicts sample-specific soft weights over F3/F5/F7. When enabled, capped RMS residual matching calibrates the routed residual magnitude before it is modulated by:
 
 - sample-wise Gate `g`,
 - bounded learnable global scale `lambda`.
 
 The adapted representation preserves the pretrained visual stream through an identity residual connection.
+
+RMS matching is scale calibration with bounded amplification, not a guarantee that every stream has an identical residual-to-input ratio or reduced sample-wise variance. The coefficient `lambda * g` is distinct from the actual injected-residual magnitude.
 
 ## Two-Stage Training
 
@@ -173,6 +175,8 @@ The repository contains the controlled A0-A6 ablation family used in the paper:
 MoRA_Med/
 ├── README.md
 ├── requirements.txt
+├── docs/
+│   └── diagnostics.md
 ├── figures/
 │   ├── framework.png
 │   ├── framerwork_detail.png
@@ -208,12 +212,15 @@ MoRA_Med/
 │   ├── biomedclip/
 │   ├── data_tools/
 │   ├── ddp/
+│   ├── evaluation/
+│   │   └── router_shuffle.py
 │   ├── qwen3vl/
 │   └── training/
 ├── LLM_api/
 │   ├── deepseek.py
 │   └── prompts/
 └── other/
+    ├── summarize_slake_diagnostics.py
     ├── generate_mimic_cxr_cache.py
     ├── generate_mimic_cxr_cache_subset_same_format.py
     ├── generate_test_official_jsonl.py
@@ -228,9 +235,11 @@ MoRA_Med/
 ### 1. Clone the repository
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
+git clone https://github.com/zhouyuqingaic-dotcom/MoRA_Med.git
 cd MoRA_Med
 ```
+
+For the revised diagnostics, check out the published revision commit or tag documented with the paper. The selected version must contain `utils/evaluation/router_shuffle.py` and `other/summarize_slake_diagnostics.py`; a pre-diagnostic version does not provide these commands.
 
 ### 2. Create the Python environment
 
@@ -536,7 +545,7 @@ torchrun --nproc_per_node=<N> \
 
 ### Semantic judge configuration
 
-The evaluation pipeline first applies dataset-specific normalized exact matching. Open-ended predictions that fail exact matching can then be evaluated by the configured deterministic semantic judge.
+The evaluation pipeline first applies deterministic, dataset-specific answer normalization and exact matching. Open-ended predictions that fail exact matching can then be evaluated using a fixed semantic-judging configuration and decision rule. Separately executed external semantic judgments are not assumed to be exactly repeatable.
 
 Set the API credentials through environment variables:
 
@@ -554,17 +563,57 @@ Under the strict scoring used in the paper, only judgments labeled `correct` are
 
 ### SLAKE
 
+Run the following commands from the repository root. Set the intended ablation,
+training seeds, and local paths in `config/slake/stage2_eval_config_slake.py`
+before validation. In the supplied configuration, the no-argument defaults
+are **A0 / seed 1024 / Stage-1 seed 1024**, not the A6 diagnostic setting.
+
 Validation checkpoint selection:
 
 ```bash
-python evaling/stage2_validate_checkpoints_slake.py
+python -m evaling.stage2_validate_checkpoints_slake
 ```
 
 Test evaluation using the selected checkpoint:
 
 ```bash
-python evaling/stage2_test_checkpoints_slake.py
+python -m evaling.stage2_test_checkpoints_slake
 ```
+
+In this diagnostic implementation, an untagged normal test writes to
+`<test_output_dir>/diagnostics/normal/<checkpoint>/`. It does not use the
+older `<test_output_dir>/<checkpoint>/` layout. Reusing the same run tag
+and checkpoint overwrites the output files in that location.
+
+#### SLAKE residual-scale and routing diagnostics
+
+These are test-time diagnostics on fixed, validation-selected checkpoints,
+not additional training conditions or a checkpoint-selection procedure.
+
+For example, collect A6 residual-scale statistics:
+
+```bash
+python -m evaling.stage2_test_checkpoints_slake \
+  --ablation-id A6 \
+  --seed 2048 \
+  --stage1-seed 2048 \
+  --test-checkpoint-mode best_validation \
+  --condition normal \
+  --collect-rms \
+  --run-tag normal_rms
+```
+
+`--collect-rms` enables logging; it does not enable or disable RMS matching
+in the model. The A2/A6 configuration determines whether matching is used.
+
+See [SLAKE diagnostic reproduction](docs/diagnostics.md) for the A2 reference,
+the three Router-only permutations, mapping provenance, output directories,
+aggregation commands, and interpretation limits.
+
+The aggregation script requires **Matplotlib**, which is not listed in the
+supplied `requirements.txt`. Before freezing the release, record the version
+from the environment that generated the diagnostic figures and add that exact
+version to `requirements.txt`. See the diagnostic guide for the command.
 
 ### VQA-Med 2019
 
@@ -649,9 +698,12 @@ Intermediate Hugging Face checkpoints also save the visual adapter through the t
 - A Stage-1 run with seed `s` is transferred only to the matching Stage-2 run with seed `s`.
 - The fixed MIMIC-CXR subset is kept identical across model-training seeds.
 - Qwen3-VL and BiomedCLIP remain frozen in both stages.
-- Dataset-specific answer normalization and semantic judging are kept fixed across model variants and seeds.
+- Dataset-specific answer-normalization rules, semantic-judge configuration, and the final decision rule are kept fixed across model variants and seeds; separately executed judge outputs need not be identical.
 - SLAKE, VQA-Med 2019, and VQA-Med 2021 use validation-based checkpoint selection.
 - VQA-RAD uses the final model weights under a predefined training schedule.
+- Diagnostic permutation seeds `12001`, `12002`, and `12003` are not training seeds.
+- Diagnostic accuracy differences use the Normal evaluation from the same diagnostic protocol; do not substitute a result from a different evaluation pass.
+- Preserve predictions, judge responses, shuffle maps, and the release commit for traceability. The aggregation script is not a replacement for a sample-wise paired audit.
 
 ## Citation
 
@@ -659,7 +711,7 @@ If you find this project useful, please cite the paper.
 
 ```bibtex
 @article{zhou2026moramed,
-  title   = {MoRA-Med: Question-Conditioned Multi-Scale Residual Adaptation for Medical Visual Question Answering},
+  title   = {MoRA-Med: Scale-Calibrated Multi-Scale Residual Adaptation for Medical Visual Question Answering},
   author  = {Zhou, Yuqing and Xu, Pengfei and Sun, Qihui and Yan, Feng},
   year    = {2026},
   note    = {Preprint}
@@ -686,5 +738,5 @@ Please follow the original licenses and data-use requirements of all upstream mo
 ---
 
 <div align="center">
-  <sub>MoRA-Med — question-conditioned visual residual adaptation for parameter-efficient Med-VQA.</sub>
+  <sub>MoRA-Med — scale-calibrated multi-scale visual residual adaptation for parameter-efficient Med-VQA.</sub>
 </div>

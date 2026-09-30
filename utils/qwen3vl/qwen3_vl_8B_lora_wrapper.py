@@ -338,6 +338,17 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
             dtype=adapter_dtype,
         )
 
+        # 初始化评测/训练期间使用的临时 BioMedCLIP 特征缓存。
+        #
+        # current_router_txt_feat:
+        #   None -> 正常路径，Router 与 Gate 都使用原始问题；
+        #   Tensor -> Router-only intervention，仅 Router 使用替换问题特征。
+        #
+        # 这些只是运行期临时属性，不进入 state_dict。
+        vision_tower.current_biomed_img_feat = None
+        vision_tower.current_biomed_txt_feat = None
+        vision_tower.current_router_txt_feat = None
+
         # 挂载冻结 BioMedCLIP extractor
         peft_model.biomed_extractor = self.biomed_extractor.to(
             device=adapter_device,
@@ -360,9 +371,14 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
 
             visual = self.base_model.model.model.visual
 
-            # 每次 forward 前先清空，避免上一个 batch 的 BioMedCLIP 特征残留
+            # 每次正常 model.forward 前先清空，
+            # 避免上一个 batch 的 BioMedCLIP / Router-only 特征残留。
+            #
+            # 训练路径不会使用 Router-only intervention，
+            # 因此这里始终将 current_router_txt_feat 置为 None。
             visual.current_biomed_img_feat = None
             visual.current_biomed_txt_feat = None
+            visual.current_router_txt_feat = None
 
             if biomed_img is not None and biomed_txt is not None:
                 if not hasattr(self, "biomed_extractor"):
@@ -394,8 +410,21 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         def patched_vision_forward(self, *args, **kwargs):
             outputs = self.original_forward(*args, **kwargs)
 
-            img_f = getattr(self, "current_biomed_img_feat", None)
-            txt_f = getattr(self, "current_biomed_txt_feat", None)
+            img_f = getattr(
+                self,
+                "current_biomed_img_feat",
+                None,
+            )
+            txt_f = getattr(
+                self,
+                "current_biomed_txt_feat",
+                None,
+            )
+            router_txt_f = getattr(
+                self,
+                "current_router_txt_feat",
+                None,
+            )
 
             grid_thw = kwargs.get("grid_thw", None)
             if grid_thw is None and len(args) > 1:
@@ -412,24 +441,44 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
                     "V2-lite visual adapter 已启用，但 vision forward 中没有拿到 grid_thw。"
                 )
 
-            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            if (
+                hasattr(outputs, "pooler_output")
+                and outputs.pooler_output is not None
+            ):
                 outputs.pooler_output = self.res_adapter(
                     outputs.pooler_output,
                     biomed_img_feat=img_f,
                     biomed_txt_feat=txt_f,
                     grid_thw=grid_thw,
+                    router_txt_feat=router_txt_f,
+                    stream_name="pooled",
                 )
 
-            if hasattr(outputs, "deepstack_features") and outputs.deepstack_features is not None:
-                outputs.deepstack_features = [
-                    self.res_adapter(
-                        x,
-                        biomed_img_feat=img_f,
-                        biomed_txt_feat=txt_f,
-                        grid_thw=grid_thw,
+            if (
+                hasattr(outputs, "deepstack_features")
+                and outputs.deepstack_features is not None
+            ):
+                adapted_deepstack_features = []
+
+                for stream_index, x in enumerate(
+                    outputs.deepstack_features
+                ):
+                    adapted_deepstack_features.append(
+                        self.res_adapter(
+                            x,
+                            biomed_img_feat=img_f,
+                            biomed_txt_feat=txt_f,
+                            grid_thw=grid_thw,
+                            router_txt_feat=router_txt_f,
+                            stream_name=(
+                                f"deepstack_{stream_index}"
+                            ),
+                        )
                     )
-                    for x in outputs.deepstack_features
-                ]
+
+                outputs.deepstack_features = (
+                    adapted_deepstack_features
+                )
 
             return outputs
 

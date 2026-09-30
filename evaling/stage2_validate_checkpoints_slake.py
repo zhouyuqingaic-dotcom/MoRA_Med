@@ -47,6 +47,23 @@ def get_adapter(model):
     return model.base_model.model.model.visual.res_adapter
 
 
+def clear_visual_runtime_cache(vision_tower):
+    """
+    清空仅在单个 evaluation batch 内有效的运行时缓存。
+
+    注意：
+    - current_biomed_img_feat / current_biomed_txt_feat
+      是原始图像-问题条件；
+    - current_router_txt_feat 是 Router-only intervention
+      使用的替换问题特征；
+    - validation checkpoint selection 必须始终使用 normal condition，
+      因此这里也显式清空 current_router_txt_feat。
+    """
+    vision_tower.current_biomed_img_feat = None
+    vision_tower.current_biomed_txt_feat = None
+    vision_tower.current_router_txt_feat = None
+
+
 def build_model(weights_path, loader, cfg, biomed_extractor):
     """
     为指定 checkpoint 重建完整模型，并加载：
@@ -235,6 +252,11 @@ def evaluate_checkpoint(
     adapter_dtype = ref_param.dtype
 
     if cfg.enable_visual_adapter:
+        # Validation 只负责 normal-condition checkpoint selection。
+        # 不在这里执行 Router-only shuffle，也不采集逐 stream RMS 日志，
+        # 避免改变选模协议和增加不必要开销。
+        adapter.enable_diagnostics(False)
+        adapter.reset_diagnostics()
         patch_generate_forward(model)
 
     # 保存所有图文对的预测、标准答案和路由诊断。
@@ -259,6 +281,12 @@ def evaluate_checkpoint(
             }
 
             if cfg.enable_visual_adapter:
+                # 每个 batch 开始前先清空运行时缓存，
+                # 防止上一个 batch 或其他诊断条件残留。
+                clear_visual_runtime_cache(
+                    vision_tower
+                )
+
                 # BioMedCLIP 图像使用模型浮点 dtype；
                 # 文本 token 保持整数 dtype。
                 image = inputs.pop(
@@ -269,7 +297,7 @@ def evaluate_checkpoint(
                     "biomed_text_tokens"
                 )
 
-                # 每个 batch 只计算一次 BioMedCLIP 图像和文本特征。
+                # 每个 batch 只计算一次 BioMedCLIP 图像和原始问题特征。
                 image_feat, text_feat = (
                     model.biomed_extractor(
                         image,
@@ -277,13 +305,23 @@ def evaluate_checkpoint(
                     )
                 )
 
-                # 缓存到视觉塔，供 generate() 内部多次 forward 复用。
+                # Validation 始终是 normal condition：
+                # Router 与 Gate 都使用原始正确问题。
                 vision_tower.current_biomed_img_feat = (
                     image_feat
                 )
                 vision_tower.current_biomed_txt_feat = (
                     text_feat
                 )
+                vision_tower.current_router_txt_feat = (
+                    None
+                )
+
+                # 清空上一 batch 的 latest_*，
+                # 这样如果本 batch 视觉路径没有真正执行，会立即被检测到。
+                adapter.latest_routing_weights = None
+                adapter.latest_soft_gate = None
+                adapter.latest_lambda = None
 
             # 贪心解码时只传必要参数。
             generate_args = {
@@ -298,78 +336,89 @@ def evaluate_checkpoint(
                     cfg.temperature
                 )
 
-            generated = model.generate(
-                **inputs,
-                **generate_args,
-            )
-
-            if cfg.enable_visual_adapter:
-                # Fusion 前向会保存当前 batch 的路由结果。
-                #
-                # routing: [B, 3]，依次对应 F3 / F5 / F7。
-                # gate:    [B]，每个图文对一个样本级 Gate。
-                # lambda:  标量，全局共享。
-                routing = (
-                    adapter
-                    .latest_routing_weights
-                    .detach()
-                    .float()
-                    .cpu()
+            try:
+                generated = model.generate(
+                    **inputs,
+                    **generate_args,
                 )
 
-                gate = (
-                    adapter
-                    .latest_soft_gate
-                    .detach()
-                    .float()
-                    .reshape(-1)
-                    .cpu()
-                )
+                if cfg.enable_visual_adapter:
+                    # Fusion 前向会保存当前 batch 的路由结果。
+                    #
+                    # routing: [B, 3]，依次对应 F3 / F5 / F7。
+                    # gate:    [B]，每个图文对一个样本级 Gate。
+                    # lambda:  标量，全局共享。
+                    if (
+                        adapter.latest_routing_weights is None
+                        or adapter.latest_soft_gate is None
+                        or adapter.latest_lambda is None
+                    ):
+                        raise RuntimeError(
+                            "当前 batch 的 Visual Adapter 没有产生新的 "
+                            "routing / gate / lambda 记录。"
+                            "请检查 generate() 是否真正经过视觉塔。"
+                        )
 
-                lambda_value = float(
-                    adapter
-                    .latest_lambda
-                    .detach()
-                    .float()
-                    .cpu()
-                    .item()
-                )
-
-                batch_size = len(metadata)
-
-                # 若维度不符合当前三专家设计，直接终止评测。
-                if routing.shape != (
-                    batch_size,
-                    3,
-                ):
-                    raise RuntimeError(
-                        f"routing shape="
-                        f"{tuple(routing.shape)}, "
-                        f"expected=({batch_size}, 3)"
+                    routing = (
+                        adapter
+                        .latest_routing_weights
+                        .detach()
+                        .float()
+                        .cpu()
                     )
 
-                if gate.shape != (
-                    batch_size,
-                ):
-                    raise RuntimeError(
-                        f"gate shape="
-                        f"{tuple(gate.shape)}, "
-                        f"expected=({batch_size},)"
+                    gate = (
+                        adapter
+                        .latest_soft_gate
+                        .detach()
+                        .float()
+                        .reshape(-1)
+                        .cpu()
                     )
 
-                # 当前 batch 使用结束后清空缓存，
-                # 防止特征错误复用到下一批样本。
-                vision_tower.current_biomed_img_feat = (
-                    None
-                )
-                vision_tower.current_biomed_txt_feat = (
-                    None
-                )
+                    lambda_value = float(
+                        adapter
+                        .latest_lambda
+                        .detach()
+                        .float()
+                        .cpu()
+                        .item()
+                    )
 
-            else:
-                routing = None
-                gate = None
-                lambda_value = None
+                    batch_size = len(metadata)
+
+                    # 若维度不符合当前三专家设计，直接终止评测。
+                    if routing.shape != (
+                        batch_size,
+                        3,
+                    ):
+                        raise RuntimeError(
+                            f"routing shape="
+                            f"{tuple(routing.shape)}, "
+                            f"expected=({batch_size}, 3)"
+                        )
+
+                    if gate.shape != (
+                        batch_size,
+                    ):
+                        raise RuntimeError(
+                            f"gate shape="
+                            f"{tuple(gate.shape)}, "
+                            f"expected=({batch_size},)"
+                        )
+
+                else:
+                    routing = None
+                    gate = None
+                    lambda_value = None
+
+            finally:
+                if cfg.enable_visual_adapter:
+                    # 即使 generate() 或诊断读取发生异常，
+                    # 也必须清空三个运行时缓存，避免污染后续 batch。
+                    clear_visual_runtime_cache(
+                        vision_tower
+                    )
 
             # model.generate() 返回：
             # [输入 prompt token + 新生成 token]。
@@ -584,6 +633,12 @@ def evaluate_checkpoint(
         "checkpoint_path": os.path.abspath(
             weights_path
         ),
+
+        # Validation checkpoint selection 始终基于正常问题条件。
+        # Router-only shuffle 只作为后续诊断，不参与选模。
+        "evaluation_condition": "normal",
+        "router_only_intervention": False,
+
         "closed_acc": (
             closed_correct / len(closed)
         ),

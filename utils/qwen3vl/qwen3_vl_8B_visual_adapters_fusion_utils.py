@@ -194,6 +194,161 @@ def compute_bounded_lambda(
     return float(lambda_max) * torch.sigmoid(lambda_a.float())
 
 
+def _compute_rms_match_tensors(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    eps: float = 1e-6,
+    ratio_clip: float | None = 10.0,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    统一计算 RMS Matching 使用的中间量。
+
+    该函数是 rms_normalize_residual() 与诊断逻辑的共同数学来源，
+    避免模型计算和日志统计分别实现一套公式后产生偏差。
+
+    Args:
+        x:
+            原始视觉特征，shape 通常为 [1, N, D]。
+
+        residual:
+            RMS Matching 前的 routed residual，
+            shape 与 x 一致。
+
+        eps:
+            与正式 RMS Matching 完全一致的数值稳定项。
+
+        ratio_clip:
+            RMS 缩放系数的上限。
+            None 表示不截断。
+
+    Returns:
+        (
+            rms_x_eps,
+            rms_r_eps,
+            ratio_unclipped,
+            ratio_applied,
+            ratio_clipped,
+        )
+
+        其中：
+            rms_x_eps:
+                sqrt(mean(x^2) + eps)
+
+            rms_r_eps:
+                sqrt(mean(residual^2) + eps)
+
+            ratio_unclipped:
+                rms_x_eps / rms_r_eps
+
+            ratio_applied:
+                实际用于 residual 缩放的系数。
+
+            ratio_clipped:
+                bool tensor，表示是否触发 ratio_clip。
+    """
+    x_fp32 = x.float()
+    r_fp32 = residual.float()
+
+    rms_x_eps = torch.sqrt(
+        torch.mean(
+            x_fp32 ** 2,
+            dim=(-2, -1),
+            keepdim=True,
+        )
+        + eps
+    )
+
+    rms_r_eps = torch.sqrt(
+        torch.mean(
+            r_fp32 ** 2,
+            dim=(-2, -1),
+            keepdim=True,
+        )
+        + eps
+    )
+
+    ratio_unclipped = (
+        rms_x_eps
+        / rms_r_eps
+    )
+
+    if ratio_clip is None:
+        ratio_applied = ratio_unclipped
+        ratio_clipped = torch.zeros_like(
+            ratio_unclipped,
+            dtype=torch.bool,
+        )
+    else:
+        ratio_applied = torch.clamp(
+            ratio_unclipped,
+            max=ratio_clip,
+        )
+
+        ratio_clipped = (
+            ratio_unclipped
+            > float(ratio_clip)
+        )
+
+    return (
+        rms_x_eps,
+        rms_r_eps,
+        ratio_unclipped,
+        ratio_applied,
+        ratio_clipped,
+    )
+
+
+def compute_rms_match_statistics(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    eps: float = 1e-6,
+    ratio_clip: float | None = 10.0,
+) -> dict[str, torch.Tensor]:
+    """
+    返回与正式 RMS Matching 完全一致的诊断张量。
+
+    该函数只负责暴露统计信息，不修改输入张量，
+    也不参与 residual injection。
+
+    建议仅在 diagnostics_enabled=True 时调用。
+
+    Returns:
+        {
+            "rms_x_eps": Tensor,
+            "rms_r_eps": Tensor,
+            "ratio_unclipped": Tensor,
+            "ratio_applied": Tensor,
+            "ratio_clipped": BoolTensor,
+        }
+    """
+    (
+        rms_x_eps,
+        rms_r_eps,
+        ratio_unclipped,
+        ratio_applied,
+        ratio_clipped,
+    ) = _compute_rms_match_tensors(
+        x=x,
+        residual=residual,
+        eps=eps,
+        ratio_clip=ratio_clip,
+    )
+
+    return {
+        "rms_x_eps": rms_x_eps,
+        "rms_r_eps": rms_r_eps,
+        "ratio_unclipped": ratio_unclipped,
+        "ratio_applied": ratio_applied,
+        "ratio_clipped": ratio_clipped,
+    }
+
+
 def rms_normalize_residual(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -204,16 +359,26 @@ def rms_normalize_residual(
     对单张图的 token + hidden 维度整体算 RMS。
 
     x/residual: [1, N, D]
+
+    注意：
+        模型实际使用的缩放系数与
+        compute_rms_match_statistics() 共用同一套内部计算，
+        因此诊断结果与正式前向保持一致。
     """
-    x_fp32 = x.float()
-    r_fp32 = residual.float()
+    (
+        _,
+        _,
+        _,
+        ratio_applied,
+        _,
+    ) = _compute_rms_match_tensors(
+        x=x,
+        residual=residual,
+        eps=eps,
+        ratio_clip=ratio_clip,
+    )
 
-    rms_x = torch.sqrt(torch.mean(x_fp32 ** 2, dim=(-2, -1), keepdim=True) + eps)
-    rms_r = torch.sqrt(torch.mean(r_fp32 ** 2, dim=(-2, -1), keepdim=True) + eps)
-
-    ratio = rms_x / rms_r
-
-    if ratio_clip is not None:
-        ratio = torch.clamp(ratio, max=ratio_clip)
-
-    return residual * ratio.to(device=residual.device, dtype=residual.dtype)
+    return residual * ratio_applied.to(
+        device=residual.device,
+        dtype=residual.dtype,
+    )
