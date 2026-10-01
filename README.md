@@ -21,6 +21,10 @@ Yuqing Zhou · Pengfei Xu · Qihui Sun · Feng Yan
 
 </div>
 
+> **Repository branch:** `export_4_To_expert_3`  
+> This branch contains the original training/evaluation implementation used for the main experiments and A0–A6 ablation studies. Revision-stage residual-scale and Router-only diagnostics are maintained separately in `revision/router-rms-diagnostics`.
+
+
 ## Overview
 
 **MoRA-Med** is a parameter-efficient framework for medical visual question answering (Med-VQA).  
@@ -115,7 +119,7 @@ The adapted representation preserves the pretrained visual stream through an ide
 
 ### Stage 1: Medical image-text pre-adaptation
 
-Stage 1 uses a fixed **160k-image MIMIC-CXR** subset. A chest X-ray image and a fixed radiology instruction form the model input, while the corresponding **IMPRESSION** report section is used as autoregressive supervision.
+Stage 1 uses a fixed **160k-study MIMIC-CXR** subset with one deterministically selected image per study. A chest X-ray image and a fixed radiology instruction form the model input, while the corresponding **IMPRESSION** report section is used as autoregressive supervision.
 
 Only the LoRA and MoRA-Med parameters are optimized. The base Qwen3-VL model and BiomedCLIP remain frozen.
 
@@ -228,8 +232,9 @@ MoRA_Med/
 ### 1. Clone the repository
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
+git clone https://github.com/zhouyuqingaic-dotcom/MoRA_Med.git
 cd MoRA_Med
+git checkout export_4_To_expert_3
 ```
 
 ### 2. Create the Python environment
@@ -351,7 +356,11 @@ mimic-cxr-jpg-2.1.0/
 └── cache/
 ```
 
-The paper uses a fixed 160k-study subset sampled with data-sampling seed `2048`, followed by deterministic selection of one image per selected study. The `IMPRESSION` section is used as the supervision target.
+Stage 1 uses MIMIC-CXR-JPG v2.1.0 and a fixed subset of **160,000 distinct studies**. The subset is constructed with data-sampling seed `2048`. After the 160,000 studies are selected, exactly one image is chosen deterministically from each selected study.
+
+The same fixed Stage-1 subset is reused across A0, A6, the ablation variants, and all model-training seeds. The data-sampling seed is therefore separate from the training seeds `1024`, `2048`, and `4096`.
+
+The `IMPRESSION` section of the corresponding radiology report is used as the Stage-1 supervision target.
 
 Relevant helpers:
 
@@ -372,6 +381,14 @@ SLAKE/Slake1.0/
 └── imgs/
 ```
 
+The experiments use the original **bilingual SLAKE split files** without language-based filtering. Both English (`q_lang="en"`) and Chinese (`q_lang="zh"`) question-answer samples are retained.
+
+The training pipeline removes a sample only when the question is empty or when the answer becomes empty after the project answer-cleaning routine; it does not filter samples by language. The original training split contains 9,835 samples, of which 9,834 remain after this validity check. The validation and test splits contain 2,099 and 2,094 samples, respectively.
+
+No language-based resampling or English-only/Chinese-only subset is used. Only the training split contributes to Stage-2 parameter optimization; the validation split is used for checkpoint selection and the test split is reserved for final evaluation.
+
+> Exact English/Chinese counts should be taken from the experiment-side `train.json`, `validate.json`, and `test.json` files if they are reported separately; they are intentionally not inferred here.
+
 ### VQA-RAD
 
 Expected layout:
@@ -388,6 +405,8 @@ A helper for constructing the official test JSONL is provided in:
 ```text
 other/generate_test_official_jsonl.py
 ```
+
+The experiments use the predefined project training split and the official test split without additional random repartitioning. VQA-RAD does not use a validation-based checkpoint-selection stage; the final model weights after the predefined training schedule are evaluated on the test set.
 
 ### VQA-Med 2019
 
@@ -409,6 +428,8 @@ VQA-Med-2019/
         └── Test_images/
 ```
 
+The original ImageCLEF training, validation, and test partitions are used without project-level random repartitioning. The training split is used for parameter optimization, the validation split only for checkpoint selection, and the official test split only for final evaluation.
+
 ### VQA-Med 2021
 
 The current pipeline consumes:
@@ -420,13 +441,25 @@ VQA-Med-2021/jsonl/
 └── test.jsonl
 ```
 
-Expected sample counts are:
+The **4,500/500/500** partition is inherited from the source benchmark files; the project does not randomly repartition a combined sample pool.
+
+The JSONL conversion uses the following source files:
+
+- **Training:** `SYSU-HCP/extracted/data/train/label.txt` together with `SYSU-HCP/extracted/data/train/images/`. This local source corresponds to the 4,500-image / 4,500-question-answer VQA-Med 2020 training set reused for VQA-Med 2021 Task 1.
+- **Validation:** `VQA-Med-2021-VQAnswering-Task1-New-ValidationSet.txt` together with the official 2021 validation images.
+- **Test:** `Task1-VQA-2021-TestSet-Questions.txt` and `Task1-VQA-2021-TestSet-ReferenceAnswers.txt` together with the corresponding test images.
+
+Each converted Task-1 record is keyed by image ID. The conversion script checks image availability and duplicate identifiers, preserves the source annotation order, verifies that test question IDs match the reference-answer IDs, and retains all available non-empty official test references.
+
+The expected converted split sizes are:
 
 - train: 4,500
 - validation: 500
 - test: 500
 
-A conversion/checking pipeline is provided in:
+No random train/validation/test split is generated by this project, so there is **no dataset-split random seed for VQA-Med 2021**. Training seeds such as `1024`, `2048`, and `4096` control model training and are unrelated to dataset membership.
+
+Conversion/checking utilities:
 
 ```text
 other/generate_vqa_med_2021_jsonl.py
