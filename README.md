@@ -389,6 +389,29 @@ No language-based resampling or English-only/Chinese-only subset is used. Only t
 
 > Exact English/Chinese counts should be taken from the experiment-side `train.json`, `validate.json`, and `test.json` files if they are reported separately; they are intentionally not inferred here.
 
+The experiments use the original bilingual SLAKE split files without
+language-based filtering. Both English (`q_lang="en"`) and Chinese
+(`q_lang="zh"`) question-answer samples are retained.
+
+The training pipeline filters samples only when the question is empty or
+when the answer becomes empty after the project answer-cleaning routine;
+it does not filter samples according to language. The original training
+split contains 9,835 samples, of which 9,834 remain after this validity
+check. The validation and test splits contain 2,099 and 2,094 samples,
+respectively.
+
+The language composition of the actual split files used in the experiments is:
+
+| Split | English | Chinese | Total used |
+|---|---:|---:|---:|
+| Train | <TRAIN_EN> | <TRAIN_ZH> | 9,834 |
+| Validation | <VAL_EN> | <VAL_ZH> | 2,099 |
+| Test | <TEST_EN> | <TEST_ZH> | 2,094 |
+
+No English-only or Chinese-only subset is constructed, and no
+language-based resampling is performed. Only the training split contributes
+to Stage-2 parameter optimization.
+
 ### VQA-RAD
 
 Expected layout:
