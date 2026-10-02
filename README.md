@@ -2,7 +2,7 @@
 
 # MoRA-Med
 
-### Question-Conditioned Multi-Scale Residual Adaptation for Medical Visual Question Answering
+### Scale-Calibrated Multi-Scale Residual Adaptation for Medical Visual Question Answering
 
 **MoRA-Med** = **Medical-oriented Routing and Residual Adaptation for Medical VQA**
 
@@ -15,20 +15,19 @@ Yuqing Zhou · Pengfei Xu · Qihui Sun · Feng Yan
   <img src="https://img.shields.io/badge/Adaptation-LoRA%20%2B%20MoRA--Med-d97706" alt="Adaptation: LoRA + MoRA-Med">
 </p>
 
-<!-- TODO after public release:
-[Paper] · [Checkpoints] · [Project Page] · [License]
--->
 
 </div>
 
 > **Repository branch:** `export_4_To_expert_3`  
 > This branch contains the original training/evaluation implementation used for the main experiments and A0–A6 ablation studies. Revision-stage residual-scale and Router-only diagnostics are maintained separately in `revision/router-rms-diagnostics`.
 
+The residual-scale and Router-only commands are available only in the [revision branch README](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/README.md#slake-diagnostics). The original main-experiment scores are not replaced by a later diagnostic evaluation pass.
+
 
 ## Overview
 
 **MoRA-Med** is a parameter-efficient framework for medical visual question answering (Med-VQA).  
-Instead of relying only on low-rank weight adaptation, MoRA-Med explicitly adapts the **frozen visual-token representation** of a pretrained multimodal large language model using lightweight, question-conditioned residual updates.
+Instead of relying only on low-rank weight adaptation, MoRA-Med explicitly adapts the **frozen visual-token representation** of a pretrained multimodal large language model using lightweight multi-scale residual updates with explicit residual-scale calibration. Image-question-conditioned routing and gating remain components of the implementation.
 
 The current implementation uses:
 
@@ -38,7 +37,7 @@ The current implementation uses:
 - Three multi-scale residual experts with **3×3, 5×5, and 7×7** depthwise convolutions.
 - A question-conditioned **Router** to adaptively combine the residual experts.
 - A sample-wise **Gate** and bounded learnable global scale to control residual injection.
-- **RMS residual matching** to stabilize the scale of the injected update.
+- **Capped RMS residual matching** to calibrate the routed residual scale under a bounded amplification factor.
 - A **two-stage adaptation strategy**: MIMIC-CXR pre-adaptation followed by downstream Med-VQA adaptation.
 
 <p align="center">
@@ -51,8 +50,8 @@ The current implementation uses:
 
 ## Highlights
 
-- **Question-conditioned visual adaptation.** The residual update depends on the current image-question pair rather than using a fixed visual transformation.
-- **Adaptive multi-scale routing.** Three receptive-field experts are softly combined through sample-specific routing weights.
+- **Multi-scale visual residual adaptation.** Lightweight residual experts explicitly modify frozen visual-token representations.
+- **Image-question-conditioned soft routing.** Three receptive-field experts are combined through sample-specific weights; weight variation alone does not establish an independent accuracy benefit.
 - **Controlled residual injection.** A learned Gate, bounded global scale, and RMS matching regulate how strongly the adapted residual modifies frozen visual tokens.
 - **Parameter efficiency.** The MoRA-Med visual branch adds **6.58M trainable parameters**, corresponding to only **3.77%** over the LoRA-only baseline.
 - **Paired multi-seed evaluation.** Experiments use seeds **1024, 2048, and 4096** under matched Stage-1/Stage-2 conditions.
@@ -100,12 +99,14 @@ The implementation uses a visual hidden dimension of **4096** and a bottleneck r
 
 ### 3. Adaptive routing, gating, and residual fusion
 
-The Router predicts sample-specific soft weights over F3/F5/F7. The routed residual is then stabilized with RMS residual matching and modulated by:
+The Router predicts sample-specific soft weights over F3/F5/F7. When enabled, capped RMS residual matching calibrates the routed residual magnitude before it is modulated by:
 
 - sample-wise Gate `g`,
 - bounded learnable global scale `lambda`.
 
 The adapted representation preserves the pretrained visual stream through an identity residual connection.
+
+RMS matching is scale calibration with bounded amplification, not a guarantee that every stream has an identical residual-to-input ratio or reduced sample-wise variance. The coefficient `lambda * g` is distinct from the actual injected-residual magnitude.
 
 ## Two-Stage Training
 
@@ -362,6 +363,8 @@ The same fixed Stage-1 subset is reused across A0, A6, the ablation variants, an
 
 The `IMPRESSION` section of the corresponding radiology report is used as the Stage-1 supervision target.
 
+This subset construction does not use the official MIMIC-CXR split file for split filtering. Keep the experiment-side subset unchanged when reproducing the paired comparisons.
+
 Relevant helpers:
 
 ```text
@@ -375,42 +378,57 @@ Expected layout:
 
 ```text
 SLAKE/Slake1.0/
-├── train.json
-├── validate.json
-├── test.json
-└── imgs/
+    train.json
+    validate.json
+    test.json
+    imgs/
 ```
 
 The experiments use the original **bilingual SLAKE split files** without language-based filtering. Both English (`q_lang="en"`) and Chinese (`q_lang="zh"`) question-answer samples are retained.
 
-The training pipeline removes a sample only when the question is empty or when the answer becomes empty after the project answer-cleaning routine; it does not filter samples by language. The original training split contains 9,835 samples, of which 9,834 remain after this validity check. The validation and test splits contain 2,099 and 2,094 samples, respectively.
+The training pipeline removes a sample only when the question is empty or when the answer becomes empty after the project answer-cleaning routine. The original training split contains 9,835 samples; 9,834 remain after this validity check. The validation and test splits contain 2,099 and 2,094 samples, respectively. No language-based resampling or English-only/Chinese-only subset is constructed. Only the training split contributes to parameter optimization; validation is used for checkpoint selection, and test is reserved for final evaluation.
 
-No language-based resampling or English-only/Chinese-only subset is used. Only the training split contributes to Stage-2 parameter optimization; the validation split is used for checkpoint selection and the test split is reserved for final evaluation.
+| Split | Samples used | Role |
+|---|---:|---|
+| Train | 9,834 | Parameter optimization |
+| Validation | 2,099 | Checkpoint selection |
+| Test | 2,094 | Final evaluation |
 
-> Exact English/Chinese counts should be taken from the experiment-side `train.json`, `validate.json`, and `test.json` files if they are reported separately; they are intentionally not inferred here.
+Exact English/Chinese counts must be measured from the experiment-side split files, not inferred from the totals. The following optional check prints the source-file language counts and the training counts after the same answer-cleaning check. It does not write files, resample data, or change the training pipeline. Run it from the repository root after setting `SLAKE_ROOT` to the directory containing the three JSON files.
 
-The experiments use the original bilingual SLAKE split files without
-language-based filtering. Both English (`q_lang="en"`) and Chinese
-(`q_lang="zh"`) question-answer samples are retained.
+```bash
+export SLAKE_ROOT="/path/to/SLAKE/Slake1.0"
+python - <<'PYCOUNT'
+import json
+import os
+from collections import Counter
+from pathlib import Path
+from utils.data_tools.prompt_cleaning.slake_answer_cleaning import (
+    slake_answer_train_cleaning,
+)
 
-The training pipeline filters samples only when the question is empty or
-when the answer becomes empty after the project answer-cleaning routine;
-it does not filter samples according to language. The original training
-split contains 9,835 samples, of which 9,834 remain after this validity
-check. The validation and test splits contain 2,099 and 2,094 samples,
-respectively.
-
-The language composition of the actual split files used in the experiments is:
-
-| Split | English | Chinese | Total used |
-|---|---:|---:|---:|
-| Train | <TRAIN_EN> | <TRAIN_ZH> | 9,834 |
-| Validation | <VAL_EN> | <VAL_ZH> | 2,099 |
-| Test | <TEST_EN> | <TEST_ZH> | 2,094 |
-
-No English-only or Chinese-only subset is constructed, and no
-language-based resampling is performed. Only the training split contributes
-to Stage-2 parameter optimization.
+root = Path(os.environ["SLAKE_ROOT"])
+for split, filename in [
+    ("train", "train.json"),
+    ("validation", "validate.json"),
+    ("test", "test.json"),
+]:
+    rows = json.loads((root / filename).read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise TypeError(f"Expected a list of records in {filename}")
+    languages = lambda items: dict(Counter(
+        str(row.get("q_lang", "")).strip().lower() for row in items
+    ))
+    print(split, "source_total=", len(rows), "source_languages=", languages(rows))
+    if split == "train":
+        used = [
+            row for row in rows
+            if str(row.get("question", "")).strip()
+            and slake_answer_train_cleaning(str(row.get("answer", "")).strip())
+        ]
+        print(split, "used_total=", len(used), "used_languages=", languages(used))
+PYCOUNT
+```
 
 ### VQA-RAD
 
@@ -511,6 +529,22 @@ At minimum, verify:
 - seed / Stage-1 seed
 - ablation ID
 
+### Configuration-to-code map
+
+The settings below document the implementation corresponding to Appendix A.2-A.4. The same LoRA/quantization setup is used for A0 and the MoRA-Med variants; the ablation ID controls which adaptation components are enabled or fixed.
+
+| Setting | Configuration / implementation entry point |
+|---|---|
+| LoRA rank, alpha, dropout, target modules | `lora_r`, `lora_alpha`, `lora_dropout`, `lora_target_modules` in the stage-specific configs; [LoRA wrapper](utils/qwen3vl/qwen3_vl_8B_lora_wrapper.py) |
+| Quantized backbone loading | `load_in_4bit`, `bnb_4bit_quant_type`, `bnb_4bit_use_double_quant`, `bnb_4bit_compute_dtype`, `torch_dtype`; [quantized loader](utils/qwen3vl/qwen3_vl_8B_quant_loader.py) |
+| Visual residual experts | [Expert implementation](utils/qwen3vl/qwen3_vl_8B_visual_adapter.py) |
+| Router, Gate, bounded global scale, RMS matching | [Fusion module](utils/qwen3vl/qwen3_vl_8B_visual_adapters_fusion.py) and [fusion utilities](utils/qwen3vl/qwen3_vl_8B_visual_adapters_fusion_utils.py) |
+| Discriminative learning rates | `use_discriminative_lr` and the module-specific learning-rate fields; [optimizer construction](utils/training/discriminative_optimizer.py) |
+| Stage-1 initialization of SLAKE Stage 2 | `stage1_seed`, `stage1_use_discriminative_lr`, and the ablation configuration in [SLAKE training config](config/slake/stage2_train_config_slake.py); [SLAKE trainer](training/stage2_trainer_slake.py) |
+| Answer scoring and judge requests | [Evaluation](#evaluation) below |
+
+For evaluation, also check `config/slake/stage2_eval_config_slake.py` and the corresponding `stage2_eval_config_*.py` in each benchmark directory. Training and evaluation must point to the intended experiment, seeds, and model directories; editing a training path does not establish that an evaluation config is correct.
+
 ## Training
 
 The training scripts are compatible with Hugging Face `Trainer` and are written to support distributed execution through `torchrun`.
@@ -592,7 +626,15 @@ torchrun --nproc_per_node=<N> \
 
 ### Semantic judge configuration
 
-The evaluation pipeline first applies dataset-specific normalized exact matching. Open-ended predictions that fail exact matching can then be evaluated by the configured deterministic semantic judge.
+The scoring chain is:
+
+```text
+raw prediction -> dataset-specific normalization -> normalized exact matching
+               -> semantic judge for unmatched open-ended answers only
+               -> response parsing -> final binary correctness
+```
+
+Normalization and exact matching follow deterministic rules. Semantic evaluation uses a **fixed judge configuration and decision rule**; separately executed external judgments are not assumed to be exactly repeatable. The same dataset-specific rules are used for A0, A6, intermediate ablations, and all compared training seeds.
 
 Set the API credentials through environment variables:
 
@@ -604,9 +646,57 @@ export DEEPSEEK_TEMPERATURE="0.0"
 export DEEPSEEK_MAX_TOKENS="256"
 ```
 
-**Never commit API keys or other credentials to a public repository.**
+The paper's judge uses `deepseek-v4-flash`, temperature `0`, and at most `256` output tokens. [The client](LLM_api/deepseek.py) explicitly disables thinking and requests a JSON object. These settings are separate from the decoding configuration used to generate the VQA model's answer. **Never commit API keys or other credentials.**
 
-Under the strict scoring used in the paper, only judgments labeled `correct` are counted as correct; `partially_correct` is not included in the reported strict accuracy.
+Closed-ended answers are decided by the dataset-specific normalized exact-match rule alone. Open-ended answers that match a normalized reference are already correct and do not require a judge call. For the remaining open-ended answers, **only `score == "correct"` counts as correct**; `partially_correct` and `incorrect` both count as incorrect in the strict accuracy reported in the paper.
+
+### Scoring implementation and traceability
+
+The full system prompt is the `medical_vqa_llm_judge_system_prompt` field in [config/LLM_config.py](config/LLM_config.py). Request construction and retry handling are in [LLM_api/deepseek.py](LLM_api/deepseek.py). Dataset-specific code locations are:
+
+| Dataset | Answer normalization | Judge user prompt and response parser |
+|---|---|---|
+| SLAKE | [slake_answer_cleaning.py](utils/data_tools/prompt_cleaning/slake_answer_cleaning.py) | [slake_prompt_builder_deepseek.py](LLM_api/prompts/slake_prompt_builder_deepseek.py) |
+| VQA-RAD | [vqa_rad_answer_cleaning.py](utils/data_tools/prompt_cleaning/vqa_rad_answer_cleaning.py) | [vqa_rad_prompt_builder_deepseek.py](LLM_api/prompts/vqa_rad_prompt_builder_deepseek.py) |
+| VQA-Med 2019 | [vqa_med_2019_answer_cleaning.py](utils/data_tools/prompt_cleaning/vqa_med_2019_answer_cleaning.py) | [vqa_med_2019_prompt_builder_deepseek.py](LLM_api/prompts/vqa_med_2019_prompt_builder_deepseek.py) |
+| VQA-Med 2021 | [vqa_med_2021_answer_cleaning.py](utils/data_tools/prompt_cleaning/vqa_med_2021_answer_cleaning.py) | `build_llm_judge_user_prompt` and `parse_llm_judge_response` in the [validation evaluator](evaling/stage2_validate_checkpoints_vqa_med_2021.py) and [test evaluator](evaling/stage2_test_checkpoints_vqa_med_2021.py) |
+
+For SLAKE, VQA-RAD, and VQA-Med 2019, evaluation cleaning standardizes case and whitespace and removes trailing formatting punctuation without semantic rewriting. VQA-Med 2021 additionally canonicalizes common Unicode punctuation/spacing variants. Its reference normalizer retains valid alternative references and removes normalized duplicates. Exact matching succeeds against **any** normalized reference, and the semantic judge receives the available alternative references rather than only the first answer.
+
+For SLAKE, VQA-RAD, and VQA-Med 2019, the judge user message contains `question`, `gt_raw`, `gt_norm`, `pred_raw`, and `pred_norm`. For VQA-Med 2021, `references_raw` and `references_norm` contain the alternative acceptable answers supplied to the judge. The complete prompt text is kept in the code locations above rather than copied into a second independently maintained prompt.
+
+#### Response parsing and failure handling
+
+| Condition | Implemented handling |
+|---|---|
+| Empty or whitespace-only API content, or a request exception | The client retries according to `retries` and `retry_seconds` in `config/LLM_config.py`; the supplied defaults are 5 attempts and a 2-second delay, with a 60-second request timeout. |
+| All client attempts fail | The client returns `"ERROR"`; the response parser assigns `incorrect`. |
+| A response has a surrounding Markdown code fence | The parser removes the supported fence before JSON parsing. |
+| JSON decoding fails | The parser assigns `incorrect` and keeps a parsing-failure reason. |
+| The returned object has a missing or unsupported `score` label | The parser assigns `incorrect`. Accepted labels are `correct`, `partially_correct`, and `incorrect`. |
+| A valid parsed label is `partially_correct` | It remains a recorded judge label, but contributes zero to strict accuracy. |
+
+These statements describe the implemented fallback paths; they do not modify the evaluator or redefine previously reported scores.
+
+#### Per-sample records and result files
+
+The evaluators save checkpoint-level `samples.jsonl`, `samples.csv`, and `summary.json`. For example, SLAKE records retain:
+
+| Purpose | Fields |
+|---|---|
+| Sample identity and original input | `index`, `image_path`, `question`, `question_category` |
+| Reference and prediction trace | `gt_raw`, `gt_norm`, `pred_raw`, `pred_norm`, `is_norm_match` |
+| Semantic-judge trace | `llm_judge_raw_response`, `llm_judge_score`, `llm_judge_reason` |
+| Binary score used by the metric | `final_correct` |
+| Available adapter diagnostics | `routing_f3`, `routing_f5`, `routing_f7`, `residual_gate`, `lambda_value`, `effective_residual_scale` |
+
+Judge fields can be null when normalized exact matching resolves a sample or the question is closed-ended. Do not interpret a missing judge response in such a record as a failed API call. `effective_residual_scale` is the coefficient `lambda * g`, not a measurement of the actual injected tensor's RMS magnitude. VQA-Med 2021 additionally saves its multi-reference fields.
+
+Use the run's saved per-sample records to trace a reported accuracy. A later external judge call, even with the same settings, is a separate evaluation pass and does not automatically replace the paper's saved scores. Historical record files need not contain a complete copy of the prompt, request settings, or Git identity; those implementation details are identified through the corresponding code version and the paths above.
+
+### Checkpoint-selection protocol
+
+SLAKE, VQA-Med 2019, and VQA-Med 2021 select the Stage-2 checkpoint using validation performance and then evaluate the selected checkpoint on test. VQA-RAD uses the final model weights after the predefined training schedule, without validation-based selection. **Test performance is never a checkpoint-selection criterion.** Paired A0/A6 runs use the same dataset-specific selection rule for each training seed.
 
 ### SLAKE
 
@@ -648,44 +738,78 @@ python evaling/stage2_test_checkpoints_vqa_rad.py
 
 ## Key Default Hyperparameters
 
+The configuration below is common to the controlled comparisons except for the designated A0-A6 ablation changes. Qwen3-VL's base parameters and BiomedCLIP remain frozen; only the enabled LoRA and MoRA-Med adaptation parameters are optimized.
+
 | Setting | Value |
-|---|---:|
-| Qwen3-VL backbone | Qwen3-VL-8B-Instruct |
-| Quantization | 4-bit NF4 + double quantization |
-| Compute dtype | bfloat16 |
-| LoRA rank | 64 |
-| LoRA alpha | 128 |
-| LoRA dropout | 0.05 |
-| Visual hidden dimension | 4096 |
-| Expert bottleneck ratio | 16 |
-| Expert latent dimension | 256 |
-| Expert kernels | 3×3 / 5×5 / 7×7 |
-| Router hidden dimension | 128 |
-| Gate initialization | 0.5 |
-| Global scale initialization | 0.9 |
-| Global scale maximum | 1.0 |
-| RMS ratio clip | 10 |
-| Max image longest edge | 1024 px |
+|---|---|
+| Qwen3-VL backbone | `Qwen3-VL-8B-Instruct` |
+| Frozen BiomedCLIP checkpoint | `BiomedCLIP-PubMedBERT_256-vit_base_patch16_224` |
+| 4-bit loading | `load_in_4bit=True` |
+| Quantization type | `bnb_4bit_quant_type="nf4"` |
+| Double quantization | `bnb_4bit_use_double_quant=True` |
+| Quantized compute dtype | `bnb_4bit_compute_dtype="bfloat16"` |
+| Backbone loading dtype | `torch_dtype="bfloat16"` |
+| LoRA rank / alpha / dropout | `64` / `128` / `0.05` |
+| LoRA attention targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
+| LoRA feed-forward targets | `gate_proj`, `up_proj`, `down_proj` |
+| Visual hidden dimension | `4096` |
+| Expert bottleneck ratio / latent dimension | `16` / `256` |
+| Expert kernels | `3 x 3`, `5 x 5`, `7 x 7` depthwise convolutions |
+| Cross-modal prior dimension | `2049` |
+| Router backbone hidden dimension | `128` |
+| Gate initialization | `gate_init=0.5` |
+| Global scale initialization / maximum | `lambda_init=0.9`, `lambda_max=1.0` |
+| RMS matching switch | `use_rms_norm=True` for A6; `False` for A2 |
+| RMS numerical epsilon | `residual_norm_eps=1e-6` |
+| RMS amplification bound | `residual_norm_ratio_clip=10.0` |
+| Maximum image longest edge | `1024` pixels |
+| Qwen visual spatial merge size | `spatial_merge_size=2` |
+
+The 4-bit storage format, quantized compute dtype, and backbone loading dtype are distinct settings; they do not imply that every tensor or trainable parameter has a single uniform dtype.
+
+### Shared visual module and initialization
+
+The **same MoRA-Med module, with shared parameters**, is applied to the pooled visual output and the deep-stack visual features. In the SLAKE diagnostic logs these streams are named `pooled`, `deepstack_0`, `deepstack_1`, and `deepstack_2`. They are not four independently trained adapter copies. Each expert's up-projection is zero-initialized, so its residual contribution starts approximately at zero and adaptation begins close to the identity mapping.
+
+The frozen BiomedCLIP prior has dimension 2049 and is projected to 128 dimensions before the Router and Gate heads. For the learned-scale configuration, the bounded global coefficient is
+
+$$
+\lambda = \lambda_{\max}\,\sigma(a),\qquad \lambda_{\max}=1,\qquad \lambda_0=0.9.
+$$
+
+The learned Gate starts at `g = 0.5`. RMS matching acts on the routed residual before the Gate and global coefficient; its amplification is capped at 10. The cap does not guarantee exact RMS equality for every stream.
 
 ### Optimization schedule
 
-| Setting | Stage 1 | Stage 2 |
+The following module-specific learning rates apply when DLR is enabled:
+
+| Setting | Stage 1: MIMIC-CXR | Stage 2 |
 |---|---:|---:|
-| LoRA LR | 2e-5 | 1e-5 |
-| Expert LR | 1e-4 | 3e-5 |
-| Router/Gate/global-scale LR | 5e-5 | 2e-5 |
-| Normalization LR | 2e-5 | 1e-5 |
+| LoRA learning rate | 2e-5 | 1e-5 |
+| Expert learning rate | 1e-4 | 3e-5 |
+| Router/Gate/global-scale learning rate | 5e-5 | 2e-5 |
+| Normalization learning rate | 2e-5 | 1e-5 |
 | Weight decay | 0.01 | 0.01 |
+| Maximum gradient norm | 1.0 | 1.0 |
 | Scheduler | cosine | cosine |
 
-Stage-2 epochs / warm-up differ by benchmark:
+The reported runs use **2 GPUs**. Batch sizes below are **per device**, not effective global batch sizes.
 
-| Dataset | Epochs | Warm-up steps |
-|---|---:|---:|
-| SLAKE | 3 | 100 |
-| VQA-Med 2019 | 3 | 100 |
-| VQA-Med 2021 | 3 | 100 |
-| VQA-RAD | 10 | 50 |
+| Stage / dataset | Epochs | Warm-up steps | Per-device batch size | Gradient accumulation |
+|---|---:|---:|---:|---:|
+| Stage 1: MIMIC-CXR | 1 | 200 | 4 | 2 |
+| Stage 2: SLAKE | 3 | 100 | 4 | 1 |
+| Stage 2: VQA-Med 2019 | 3 | 100 | 4 | 1 |
+| Stage 2: VQA-Med 2021 | 3 | 100 | 4 | 2 |
+| Stage 2: VQA-RAD | 10 | 50 | 1 | 2 |
+
+### A1: uniform learning rates and two-stage initialization
+
+For the SLAKE A1 ablation reported in the paper, DLR is disabled in **both** stages. All trainable adaptation parameters use a single learning rate of **2e-5 in Stage 1** and **1e-5 in Stage 2**. Stage 2 inherits the **corresponding A1 Stage-1 model with the same seed**, not an A6 Stage-1 initialization.
+
+Use `--ablation_id A1 --seed 2048` with the Stage-1 training entry point. For SLAKE Stage 2, set `ablation_id="A1"`, `seed=2048`, and `stage1_seed=2048` in `config/slake/stage2_train_config_slake.py`, then use the Stage-2 command in [Training](#training). The A1 configuration disables both `use_discriminative_lr` and `stage1_use_discriminative_lr`, and the Stage-2 uniform `learning_rate` is `1e-5`. Check the resolved Stage-1 source before launching the run; changing only a learning-rate field while leaving the A6 ablation ID/source in place does not reproduce A1.
+
+The learning rates and initialization described here reproduce the protocol reported in Appendix A.4; a current default configuration is not a substitute for the saved settings of an already completed historical run.
 
 ## Checkpoint Contents
 
@@ -699,13 +823,19 @@ visual_adapter.pt
 
 Intermediate Hugging Face checkpoints also save the visual adapter through the training callback.
 
+### Stage-1 to Stage-2 parameter transfer
+
+For a matched two-stage run, load the Stage-1 LoRA parameters and, when the visual branch is enabled, the complete `visual_adapter.pt` state from the same ablation configuration and training seed. The SLAKE trainer loads the visual-adapter state with `strict=True`. The frozen backbone models are loaded from their original pretrained model directories.
+
+Stage-2 optimization is initialized anew: the Stage-1 optimizer and scheduler states are not continued. This is **adaptation-parameter transfer**, not optimizer-state resume. A0 has no enabled MoRA-Med visual branch to transfer. The A1-specific two-stage rule is given in [A1: uniform learning rates and two-stage initialization](#a1-uniform-learning-rates-and-two-stage-initialization).
+
 ## Reproducibility Notes
 
 - Main comparisons use paired seeds: `1024`, `2048`, and `4096`.
 - A Stage-1 run with seed `s` is transferred only to the matching Stage-2 run with seed `s`.
 - The fixed MIMIC-CXR subset is kept identical across model-training seeds.
 - Qwen3-VL and BiomedCLIP remain frozen in both stages.
-- Dataset-specific answer normalization and semantic judging are kept fixed across model variants and seeds.
+- Dataset-specific normalization rules, the semantic-judge configuration, and the final decision rule are fixed across compared runs; independently executed judge responses need not be identical.
 - SLAKE, VQA-Med 2019, and VQA-Med 2021 use validation-based checkpoint selection.
 - VQA-RAD uses the final model weights under a predefined training schedule.
 
@@ -715,7 +845,7 @@ If you find this project useful, please cite the paper.
 
 ```bibtex
 @article{zhou2026moramed,
-  title   = {MoRA-Med: Question-Conditioned Multi-Scale Residual Adaptation for Medical Visual Question Answering},
+  title   = {MoRA-Med: Scale-Calibrated Multi-Scale Residual Adaptation for Medical Visual Question Answering},
   author  = {Zhou, Yuqing and Xu, Pengfei and Sun, Qihui and Yan, Feng},
   year    = {2026},
   note    = {Preprint}
@@ -742,5 +872,5 @@ Please follow the original licenses and data-use requirements of all upstream mo
 ---
 
 <div align="center">
-  <sub>MoRA-Med — question-conditioned visual residual adaptation for parameter-efficient Med-VQA.</sub>
+  <sub>MoRA-Med — scale-calibrated multi-scale visual residual adaptation for parameter-efficient Med-VQA.</sub>
 </div>
