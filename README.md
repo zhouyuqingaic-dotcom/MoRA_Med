@@ -176,6 +176,8 @@ The repository contains the controlled A0-A6 ablation family used in the paper:
 MoRA_Med/
 ├── README.md
 ├── requirements.txt
+├── docs/
+│   └── diagnostics.md
 ├── figures/
 │   ├── framework.png
 │   ├── framerwork_detail.png
@@ -544,6 +546,19 @@ At minimum, verify:
 - seed / Stage-1 seed
 - ablation ID
 
+### LoRA target-module list
+
+The complete target-module list used by the controlled experiments is set by `lora_target_modules` in the stage-specific configuration files:
+
+```python
+lora_target_modules = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
+```
+
+The first four names identify attention projections; the remaining three identify feed-forward projections. The LoRA rank, alpha, dropout, and backbone-loading settings are listed under [Key Default Hyperparameters](#key-default-hyperparameters). Together, these sections provide the target-module and loading configurations referenced in Appendix A.2.
+
 ### Configuration-to-code map
 
 The settings below document the implementation corresponding to Appendix A.2-A.4. The same LoRA/quantization setup is used for A0 and the MoRA-Med variants; the ablation ID controls which adaptation components are enabled or fixed.
@@ -649,7 +664,7 @@ raw prediction -> dataset-specific normalization -> normalized exact matching
                -> response parsing -> final binary correctness
 ```
 
-Normalization and exact matching follow deterministic rules. Semantic evaluation uses a **fixed judge configuration and decision rule**; separately executed external judgments are not assumed to be exactly repeatable. The same dataset-specific rules are used for A0, A6, intermediate ablations, and all compared training seeds.
+Normalization and exact matching follow deterministic rules. Semantic evaluation uses a **fixed judge configuration and decision rule**. Separately executed external semantic judgments are not assumed to be exactly repeatable. The same dataset-specific rules are used for A0, A6, intermediate ablations, and all compared training seeds.
 
 Set the API credentials through environment variables:
 
@@ -769,6 +784,8 @@ python evaling/stage2_test_checkpoints_vqa_rad.py
 
 This section documents the test-time procedures implemented in **`revision/router-rms-diagnostics`**. Use the same SLAKE split, frozen backbone models, evaluation rules, and validation-selection protocol as the original experiment pipeline. No new training or dataset split is involved.
 
+The linked [diagnostic reproduction guide](docs/diagnostics.md) documents the A6/A2 commands, permutation-map provenance, output layout, logging fields, and aggregation procedure referenced in Appendix A.6. It also includes the [extended 40-sample routing visualization](docs/diagnostics.md#10-extended-sample-level-routing-visualization).
+
 ### Scope and selected checkpoints
 
 The reported diagnostics use Stage-1 and Stage-2 training seed `2048`. The A6 Router-only analysis keeps one trained, validation-selected checkpoint fixed. The residual-scale comparison uses the separately trained, validation-selected A2 and A6 models. In the reported SLAKE runs, both experiment directories contain a selected checkpoint named `checkpoint-1845`; **these are different A2/A6 model states despite sharing the same basename**.
@@ -826,16 +843,20 @@ The mapping is a one-to-one derangement **within explicit dataset language group
 Use the three fixed permutation seeds from the paper:
 
 ```bash
-for permutation_seed in 12001 12002 12003; do
+for spec in 01:12001 02:12002 03:12003; do
+  shuffle_id="${spec%%:*}"
+  shuffle_seed="${spec##*:}"
+
   python -m evaling.stage2_test_checkpoints_slake \
     --ablation-id A6 \
     --seed 2048 \
     --stage1-seed 2048 \
     --test-checkpoint-mode best_validation \
     --condition router_shuffle \
-    --shuffle-seed "${permutation_seed}" \
+    --shuffle-seed "${shuffle_seed}" \
+    --shuffle-id "${shuffle_id}" \
     --shuffle-language-key auto \
-    --run-tag "router_shuffle_${permutation_seed}"
+    --run-tag "router_shuffle_${shuffle_id}" || break
 done
 ```
 
@@ -869,14 +890,14 @@ Diagnostic results are written below each experiment's existing test output dire
                 samples.csv
                 summary.json
                 rms_diagnostics.jsonl
-        router_shuffle_12001/
+        router_shuffle_01/
             leaderboard.json
             checkpoint-1845/
                 samples.jsonl
                 samples.csv
                 summary.json
-        router_shuffle_12002/...
-        router_shuffle_12003/...
+        router_shuffle_02/...
+        router_shuffle_03/...
 
 <A2 test output directory>/
     diagnostics/
@@ -931,7 +952,7 @@ Set the two variables below to the actual **A6** and **A2** diagnostics director
 export A6_DIAGNOSTICS_ROOT="/path/to/A6/experiment/test/diagnostics"
 export A2_DIAGNOSTICS_ROOT="/path/to/A2/experiment/test/diagnostics"
 
-python other/summarize_slake_diagnostics.py \
+MPLBACKEND=Agg python -m other.summarize_slake_diagnostics \
   --diagnostics-root "${A6_DIAGNOSTICS_ROOT}" \
   --a2-diagnostics-root "${A2_DIAGNOSTICS_ROOT}" \
   --normal-tag normal_rms \
@@ -963,6 +984,8 @@ The paper keeps the original main-experiment evaluation and the diagnostic Norma
 The observed permutations do not establish a consistent accuracy decrease for the evaluated checkpoint. This does not demonstrate Router ineffectiveness, statistical equivalence, unchanged predictions, or superiority of incorrect questions. The Gate and main model still receive the original question. RMS matching characterizes scale calibration with bounded amplification; neither a narrow `lambda * g` distribution nor the A2/A6 comparison establishes universally reduced injection variability or an independent causal explanation of the accuracy gain.
 
 ### Extended sample-level routing visualization
+
+The corresponding guide entry is [Section 10 of the diagnostic reproduction guide](docs/diagnostics.md#10-extended-sample-level-routing-visualization).
 
 The following figure reproduces the **existing descriptive analysis** of 40 selected SLAKE test examples from the seed-2048 validation-selected A6 checkpoint (the manuscript's extended routing visualization, formerly Appendix C.4 / Figure C.8). It is not a newly generated Router-only permutation result and is not regenerated by `summarize_slake_diagnostics.py`.
 
