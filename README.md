@@ -21,7 +21,7 @@ Yuqing Zhou · Pengfei Xu · Qihui Sun · Feng Yan
 > **Repository branch:** `export_4_To_expert_3`  
 > This branch contains the original training/evaluation implementation used for the main experiments and A0–A6 ablation studies. Revision-stage residual-scale and Router-only diagnostics are maintained separately in `revision/router-rms-diagnostics`.
 
-The residual-scale and Router-only commands are available only in the [revision branch README](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/README.md#slake-diagnostics). The original main-experiment scores are not replaced by a later diagnostic evaluation pass.
+The residual-scale and Router-only commands are available only in the diagnostic branch; see the [revision branch README](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/README.md#slake-diagnostics) and its [diagnostic reproduction guide](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/docs/diagnostics.md). The original main-experiment scores are not replaced by a later diagnostic evaluation pass.
 
 
 ## Overview
@@ -529,6 +529,19 @@ At minimum, verify:
 - seed / Stage-1 seed
 - ablation ID
 
+### LoRA target-module list
+
+The complete target-module list used by the controlled experiments is set by `lora_target_modules` in the stage-specific configuration files:
+
+```python
+lora_target_modules = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
+```
+
+The first four names identify attention projections; the remaining three identify feed-forward projections. The LoRA rank, alpha, dropout, and backbone-loading settings are listed under [Key Default Hyperparameters](#key-default-hyperparameters). Together, these sections provide the target-module and loading configurations referenced in Appendix A.2.
+
 ### Configuration-to-code map
 
 The settings below document the implementation corresponding to Appendix A.2-A.4. The same LoRA/quantization setup is used for A0 and the MoRA-Med variants; the ablation ID controls which adaptation components are enabled or fixed.
@@ -634,7 +647,7 @@ raw prediction -> dataset-specific normalization -> normalized exact matching
                -> response parsing -> final binary correctness
 ```
 
-Normalization and exact matching follow deterministic rules. Semantic evaluation uses a **fixed judge configuration and decision rule**; separately executed external judgments are not assumed to be exactly repeatable. The same dataset-specific rules are used for A0, A6, intermediate ablations, and all compared training seeds.
+Normalization and exact matching follow deterministic rules. Semantic evaluation uses a **fixed judge configuration and decision rule**. Separately executed external semantic judgments are not assumed to be exactly repeatable. The same dataset-specific rules are used for A0, A6, intermediate ablations, and all compared training seeds.
 
 Set the API credentials through environment variables:
 
