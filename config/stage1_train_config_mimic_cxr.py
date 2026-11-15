@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Optional
 from utils.ddp.ddp_utils import ddp_print
+from config.a7_settings import get_a7_fixed_stream_scales, a7_experiment_label
 
 #获取命令行参数
 import argparse
@@ -11,7 +12,7 @@ def parse_args():
         "--ablation_id",
         type=str,
         default="A0",
-        choices=["A0", "A1", "A2", "A3", "A4", "A5", "A6"],
+        choices=["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7"],
     )
 
     parser.add_argument(
@@ -343,6 +344,7 @@ class TrainConfig:
     use_rms_norm: bool = True
     residual_norm_eps: float = 1e-6
     residual_norm_ratio_clip: Optional[float] = 10.0
+    fixed_stream_scales: Optional[list[float]] = None
 
 
     def __post_init__(self):
@@ -522,10 +524,20 @@ class TrainConfig:
             # 保持 residual RMS normalization
             self.use_rms_norm = True
 
+        elif aid == "A7":
+            # The only change versus A6 is static per-stream residual scale.
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
+            self.use_discriminative_lr = True
+            self.use_rms_norm = False
+            self.fixed_stream_scales = get_a7_fixed_stream_scales()
+
         else:
             raise ValueError(
                 f"不支持的 ablation_id: {self.ablation_id}。"
-                "可选值为 A0、A1、A2、A3、A4、A5、A6。"
+                "可选值为 A0、A1、A2、A3、A4、A5、A6、A7。"
             )
 
 
@@ -729,6 +741,14 @@ class TrainConfig:
                 f"{gate_label}_"
                 f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
+                f"Seed-{self.seed}"
+            )
+
+        elif self.ablation_id == "A7":
+            experiment_name = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.mimic_cxr_cache_prefix}_"
+                f"{a7_experiment_label(self.fixed_stream_scales)}_"
                 f"Seed-{self.seed}"
             )
 

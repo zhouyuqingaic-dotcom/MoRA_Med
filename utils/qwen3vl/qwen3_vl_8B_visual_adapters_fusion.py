@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 
@@ -53,6 +54,7 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
         use_rms_norm: bool = True,
         residual_norm_eps: float = 1e-6,
         residual_norm_ratio_clip: float | None = 10.0,
+        fixed_stream_scales: list[float] | tuple[float, ...] | None = None,
 
         use_cross_modal_prior: bool = True,
     ):
@@ -72,6 +74,19 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
         self.residual_norm_eps = residual_norm_eps
         self.residual_norm_ratio_clip = residual_norm_ratio_clip
         self.use_cross_modal_prior = use_cross_modal_prior
+
+        # A7 only: four non-trainable coefficients, one per visual stream.
+        # A plain tuple keeps A0-A6 state_dict keys exactly unchanged.
+        self.fixed_stream_scales = None
+        if fixed_stream_scales is not None:
+            if self.use_rms_norm:
+                raise ValueError("A7 fixed scaling requires use_rms_norm=False")
+            if len(fixed_stream_scales) != 4:
+                raise ValueError("A7 requires 4 fixed_stream_scales")
+            values = tuple(float(v) for v in fixed_stream_scales)
+            if not all(math.isfinite(v) and 0.0 < v <= 10.0 for v in values):
+                raise ValueError("A7 fixed scales must be in (0, 10]")
+            self.fixed_stream_scales = values
 
         self.norm = nn.LayerNorm(hidden_dim)
 
@@ -322,6 +337,7 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
         biomed_img_feat: torch.Tensor,
         biomed_txt_feat: torch.Tensor,
         grid_thw: torch.Tensor,
+        stream_id: int = 0,
     ) -> torch.Tensor:
         """
         Args:
@@ -343,6 +359,8 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
             grid_thw:
                 每张图片对应的原始 Qwen 视觉网格。
                 shape: [num_images, 3]
+            stream_id:
+                0=pooled, 1/2/3=deepstack_0/1/2 (A7 only).
 
         Returns:
             与输入 x 形状一致的视觉特征。
@@ -496,6 +514,7 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
             )
 
             if self.use_rms_norm:
+                # A6: unchanged per-sample, per-stream capped RMS matching.
                 residual = rms_normalize_residual(
                     x=sub_x,
                     residual=residual,
@@ -504,6 +523,11 @@ class Qwen3VLMoEVisualAdapterFusion(nn.Module):
                         self.residual_norm_ratio_clip
                     ),
                 )
+            elif self.fixed_stream_scales is not None:
+                # A7: fixed per-stream multiplier. Never compute a test-time RMS.
+                if not isinstance(stream_id, int) or not 0 <= stream_id < 4:
+                    raise ValueError(f"Invalid A7 stream_id: {stream_id!r}")
+                residual = residual * self.fixed_stream_scales[stream_id]
 
             sub_out = (
                 sub_x

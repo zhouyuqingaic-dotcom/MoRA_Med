@@ -142,6 +142,7 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         use_rms_norm: bool = True,
         residual_norm_eps: float = 1e-6,
         residual_norm_ratio_clip: Optional[float] = 10.0,
+        fixed_stream_scales: Optional[List[float]] = None,
     ):
         # LoRA
         self.r = lora_r
@@ -181,6 +182,7 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
         self.use_rms_norm = use_rms_norm
         self.residual_norm_eps = residual_norm_eps
         self.residual_norm_ratio_clip = residual_norm_ratio_clip
+        self.fixed_stream_scales = fixed_stream_scales
 
         self._validate_modes()
 
@@ -270,7 +272,8 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
             f"scale_mode={self.scale_mode}, "
             f"gate_mode={self.gate_mode}, "
             f"lambda_mode={self.lambda_mode}, "
-            f"use_rms_norm={self.use_rms_norm}"
+            f"use_rms_norm={self.use_rms_norm}, "
+            f"fixed_stream_scales={self.fixed_stream_scales}"
         )
 
         vision_tower = peft_model.base_model.model.model.visual
@@ -326,6 +329,7 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
             residual_norm_ratio_clip=(
                 self.residual_norm_ratio_clip
             ),
+            fixed_stream_scales=self.fixed_stream_scales,
 
             use_cross_modal_prior=(
                 self.use_cross_modal_prior
@@ -418,17 +422,21 @@ class Qwen3VLLoraAndVisualAdapterWrapper:
                     biomed_img_feat=img_f,
                     biomed_txt_feat=txt_f,
                     grid_thw=grid_thw,
+                    stream_id=0,  # pooled
                 )
 
             if hasattr(outputs, "deepstack_features") and outputs.deepstack_features is not None:
+                if self.res_adapter.fixed_stream_scales is not None and len(outputs.deepstack_features) != 3:
+                    raise ValueError("A7 expects three deepstack feature streams")
                 outputs.deepstack_features = [
                     self.res_adapter(
                         x,
                         biomed_img_feat=img_f,
                         biomed_txt_feat=txt_f,
                         grid_thw=grid_thw,
+                        stream_id=j + 1,  # deepstack_0/1/2
                     )
-                    for x in outputs.deepstack_features
+                    for j, x in enumerate(outputs.deepstack_features)
                 ]
 
             return outputs

@@ -376,6 +376,7 @@ def main():
         use_rms_norm=cfg.use_rms_norm,
         residual_norm_eps=cfg.residual_norm_eps,
         residual_norm_ratio_clip=cfg.residual_norm_ratio_clip,
+        fixed_stream_scales=cfg.fixed_stream_scales,
     )
 
     ddp_print(

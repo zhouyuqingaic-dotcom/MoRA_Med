@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 from utils.ddp.ddp_utils import ddp_print
+from config.a7_settings import get_a7_fixed_stream_scales, a7_experiment_label
 
 @dataclass
 class Stage2TrainConfig:
@@ -22,11 +23,11 @@ class Stage2TrainConfig:
 
     # Stage 2 的随机种子,必须和stage1一致
     # seed: int = 2048
-    seed: int = 1024 #4096
+    seed: int = 2048 # A7 seed; match your original A6 paired run
 
     # Stage 1 训练时使用的随机种子，用于推导权重目录
     # stage1_seed: int = 2048
-    stage1_seed: int = 1024 #4096
+    stage1_seed: int = 2048 # Same seed used for A7 Stage 1
 
     # Stage 1 使用的 MIMIC-CXR 数据缓存前缀。
     # 必须与 Stage 1 TrainConfig 中的 mimic_cxr_cache_prefix 完全一致。
@@ -42,7 +43,7 @@ class Stage2TrainConfig:
     )
 
     # 必须与要加载的 Stage 1 消融保持一致
-    ablation_id: str = "A6" #"A1" #"A2" #"A3" #"A4" #"A0" #"A6" #"A6" #"A0" #"A5"
+    ablation_id: str = "A7" # Stream-wise fixed residual scaling
 
     output_root: str = "/home/yuqing/Models/MoRA_Med"
 
@@ -202,6 +203,7 @@ class Stage2TrainConfig:
     use_rms_norm: bool = True
     residual_norm_eps: float = 1e-6
     residual_norm_ratio_clip: Optional[float] = 10.0
+    fixed_stream_scales: Optional[list[float]] = None
 
     def __post_init__(self):
         if len(self.fixed_scale_weights) != 3:
@@ -347,10 +349,21 @@ class Stage2TrainConfig:
             self.use_discriminative_lr = True
             self.stage1_use_discriminative_lr = True
 
+        elif aid == "A7":
+            # Keep A6 experts, learned router/gate/lambda and DLR.
+            self.enable_visual_adapter = True
+            self.scale_mode = "learned"
+            self.gate_mode = "learned"
+            self.lambda_mode = "learnable"
+            self.use_discriminative_lr = True
+            self.stage1_use_discriminative_lr = True
+            self.use_rms_norm = False
+            self.fixed_stream_scales = get_a7_fixed_stream_scales()
+
         else:
             raise ValueError(
                 f"不支持的 ablation_id：{aid}。"
-                "可选值为 A0、A1、A2、A3、A4、A5、A6。"
+                "可选值为 A0、A1、A2、A3、A4、A5、A6、A7。"
             )
 
         # -----------------------------------------------------
@@ -523,6 +536,14 @@ class Stage2TrainConfig:
                 f"Seed-{self.stage1_seed}"
             )
 
+
+        elif self.ablation_id == "A7":
+            stage1_experiment_dir = (
+                f"Stage1_MIMIC_CXR_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{a7_experiment_label(self.fixed_stream_scales)}_"
+                f"Seed-{self.stage1_seed}"
+            )
 
         elif self.ablation_id == "A6":
             stage1_a6_label = (
@@ -746,6 +767,15 @@ class Stage2TrainConfig:
                 f"{gate_label}_"
                 f"{lambda_label}_"
                 f"RMS-{int(self.use_rms_norm)}_"
+                f"From-Stage1-Seed-{self.stage1_seed}_"
+                f"Seed-{self.seed}"
+            )
+
+        elif self.ablation_id == "A7":
+            stage2_experiment_dir = (
+                f"Stage2_SLAKE_"
+                f"{self.stage1_mimic_cxr_cache_prefix}_"
+                f"{a7_experiment_label(self.fixed_stream_scales)}_"
                 f"From-Stage1-Seed-{self.stage1_seed}_"
                 f"Seed-{self.seed}"
             )

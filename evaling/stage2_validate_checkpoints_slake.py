@@ -98,6 +98,7 @@ def build_model(weights_path, loader, cfg, biomed_extractor):
         use_rms_norm=cfg.use_rms_norm,
         residual_norm_eps=cfg.residual_norm_eps,
         residual_norm_ratio_clip=cfg.residual_norm_ratio_clip,
+        fixed_stream_scales=cfg.fixed_stream_scales,
     )
 
     model = wrapper.wrap(base_model)
