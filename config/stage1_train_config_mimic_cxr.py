@@ -234,9 +234,16 @@ class TrainConfig:
     # =========================================================
     # 6. 训练超参数
     # =========================================================
+    #4卡训练时
+    # per_device_train_batch_size: int = 4
+    # gradient_accumulation_steps: int = 2
+    # num_train_epochs: float = 1.0
+
+    #双卡训练时
     per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4
     num_train_epochs: float = 1.0
+
 
     # =========================================================
     # A6-DLR 分组学习率

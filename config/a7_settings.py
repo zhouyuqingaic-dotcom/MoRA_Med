@@ -10,7 +10,12 @@ import math
 # EXAMPLE of format ONLY: (1.0, 10.0, 10.0, 5.0)
 # These example numbers are NOT measured or recommended.
 # Before formal A7 runs, replace None with your four calibrated values.
-A7_FIXED_STREAM_SCALES: tuple[float, float, float, float] | None = None
+A7_FIXED_STREAM_SCALES: tuple[float, float, float, float] | None = (
+    2.11582434,
+    10.0,
+    10.0,
+    4.59969044,
+)
 
 
 def get_a7_fixed_stream_scales() -> list[float]:

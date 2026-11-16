@@ -123,12 +123,12 @@ class Stage2TrainConfig:
     # 6. SLAKE 训练超参数
     # =========================================================
     #重要，一定要根据卡数量调整，这回改变参数更新次数
-    ## 双卡：
-    # per_device_train_batch_size = 4
-    # gradient_accumulation_steps = 2
-    #四卡：
+    # 双卡：
     per_device_train_batch_size = 4
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 2
+    #四卡：
+    # per_device_train_batch_size = 4
+    # gradient_accumulation_steps = 1
 
     num_train_epochs: float = 3.0
 
