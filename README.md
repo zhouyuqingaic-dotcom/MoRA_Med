@@ -18,10 +18,10 @@ Yuqing Zhou · Pengfei Xu · Qihui Sun · Feng Yan
 
 </div>
 
-> **Repository branch:** `export_4_To_expert_3`  
-> This branch contains the original training/evaluation implementation used for the main experiments and A0–A6 ablation studies. Revision-stage residual-scale and Router-only diagnostics are maintained separately in `revision/router-rms-diagnostics`.
+> **Repository branch:** `experiment/A7-streamwise-fixed`  
+> This branch extends `export_4_To_expert_3` with the training-calibrated fixed stream-wise scaling ablation (**A7**), the paired A6 vs. A7 SLAKE comparison script, and the fixed-length SLAKE inference-efficiency benchmark (A0 / A6 / A7). Core training, evaluation, and A0–A6 ablations are maintained in [`export_4_To_expert_3`](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/tree/export_4_To_expert_3); residual-scale and Router-only diagnostics are maintained separately in [`revision/router-rms-diagnostics`](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/tree/revision/router-rms-diagnostics).
 
-The residual-scale and Router-only commands are available only in the diagnostic branch; see the [revision branch README](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/README.md#slake-diagnostics) and its [diagnostic reproduction guide](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/docs/diagnostics.md). The original main-experiment scores are not replaced by a later diagnostic evaluation pass.
+For step-by-step A7 calibration, paired A6–A7 evaluation, and inference-efficiency benchmark commands, see [A7 Fixed Stream-Wise Scaling and Inference Efficiency](#a7-fixed-stream-wise-scaling-and-inference-efficiency). For residual-scale and Router-only diagnostic commands, see the [revision branch README](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/README.md#slake-diagnostics) and its [diagnostic reproduction guide](https://github.com/zhouyuqingaic-dotcom/MoRA_Med/blob/revision/router-rms-diagnostics/docs/diagnostics.md).
 
 
 ## Overview
@@ -160,7 +160,7 @@ MoRA-Med shows the clearest and most consistent gains on **SLAKE** and **VQA-RAD
 
 ## Ablation Configurations
 
-The repository contains the controlled A0-A6 ablation family used in the paper:
+This branch supports the controlled A0–A7 ablation family used in the paper:
 
 | ID | Configuration |
 |---|---|
@@ -170,7 +170,8 @@ The repository contains the controlled A0-A6 ablation family used in the paper:
 | A3 | MoRA-Med with fixed `lambda = 0.9` |
 | A4 | MoRA-Med with fixed `g = 0.5` |
 | A5 | MoRA-Med with uniform routing weights `(1/3, 1/3, 1/3)` |
-| A6 | Full MoRA-Med |
+| A6 | Full MoRA-Med (dynamic capped RMS matching) |
+| A7 | MoRA-Med with training-calibrated fixed stream-wise scaling (replaces dynamic RMS matching) |
 
 ## Repository Structure
 
@@ -184,6 +185,7 @@ MoRA_Med/
 │   └── two_stage_training.png
 ├── config/
 │   ├── LLM_config.py
+│   ├── a7_settings.py
 │   ├── stage1_train_config_mimic_cxr.py
 │   ├── slake/
 │   ├── vqa_rad/
@@ -219,6 +221,10 @@ MoRA_Med/
 │   ├── deepseek.py
 │   └── prompts/
 └── other/
+    ├── estimate_a7_scales_mimic.py
+    ├── check_a7_stream_scaling.py
+    ├── compare_a6_a7_slake.py
+    ├── benchmark_slake_inference.py
     ├── generate_mimic_cxr_cache.py
     ├── generate_mimic_cxr_cache_subset_same_format.py
     ├── generate_test_official_jsonl.py
@@ -748,6 +754,81 @@ python evaling/stage2_test_checkpoints_vqa_rad.py
 ```
 
 > The test set is not used for checkpoint selection.
+
+## A7 Fixed Stream-Wise Scaling and Inference Efficiency
+
+This section documents the standalone scripts added in `experiment/A7-streamwise-fixed` to reproduce the A7 fixed stream-wise calibration ablation, the paired A6 vs. A7 SLAKE evaluation comparison, and the SLAKE inference-efficiency benchmark. Run all commands from the repository root with `PYTHONPATH=.` set.
+
+### 1. Estimate A7 stream-wise multipliers from MIMIC-CXR training data
+
+Estimate the four stream-wise median multipliers (`pooled`, `deepstack_0`, `deepstack_1`, `deepstack_2`) using `2,048` distinct MIMIC-CXR Stage-1 training samples (`--sampling-seed 2048`) and the matched A6 Stage-1 checkpoint (`seed=2048`, no SLAKE validation/test data used):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python other/estimate_a7_scales_mimic.py \
+  --num-samples 2048 \
+  --sampling-seed 2048 \
+  --a6-seed 2048
+```
+
+The calibrated coefficients used in the paper are recorded in `config/a7_settings.py`:
+
+```python
+A7_FIXED_STREAM_SCALES = (2.11582434, 10.0, 10.0, 4.59969044)
+```
+
+### 2. Verify A7 fixed stream-wise scaling behavior
+
+Run the lightweight unit check to verify that `fixed_stream_scales` replaces dynamic RMS matching without adding trainable parameters:
+
+```bash
+PYTHONPATH=. python other/check_a7_stream_scaling.py
+```
+
+### 3. Train and evaluate A7 (Stage 1 MIMIC-CXR -> Stage 2 SLAKE)
+
+Stage 1 (MIMIC-CXR, seed `2048`):
+
+```bash
+torchrun --nproc_per_node=2 \
+  training/stage1_trainer_mimic_cxr.py \
+  --ablation_id A7 \
+  --seed 2048
+```
+
+Stage 2 (SLAKE, with `ablation_id="A7"`, `seed=2048`, `stage1_seed=2048` in `config/slake/stage2_train_config_slake.py`):
+
+```bash
+torchrun --nproc_per_node=2 training/stage2_trainer_slake.py
+python evaling/stage2_validate_checkpoints_slake.py
+python evaling/stage2_test_checkpoints_slake.py
+```
+
+### 4. Paired A6 vs. A7 SLAKE comparison (no GPU or API required)
+
+Compare the validation-selected A6 and A7 checkpoints on the exact same `2,094` SLAKE test samples and compute the paired nonparametric bootstrap 95% confidence interval (`2,000` resamples, seed `2048`):
+
+```bash
+PYTHONPATH=. python other/compare_a6_a7_slake.py \
+  --model-root /path/to/Models/MoRA_Med \
+  --eval-root /path/to/Models/MoRA_Med/Eval_SLAKE
+```
+
+Outputs are written to `logs/a6_a7_comparison/` (`a6_a7_accuracy_comparison.csv`, `a6_a7_comparison.json`, and `a6_a7_disagreements.csv`).
+
+### 5. SLAKE inference-efficiency benchmark (A0 / A6 / A7)
+
+Run each variant in a **separate Python process** on the same single GPU (`128` fixed SLAKE test questions sampled with `--sample-seed 2048`, batch size `1`, `4` warm-up batches, fixed greedy decoding of `32` generated tokens; excludes disk I/O, CPU preprocessing, model loading, and LLM judging):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python other/benchmark_slake_inference.py --variant A0 --seed 2048
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python other/benchmark_slake_inference.py --variant A6 --seed 2048
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python other/benchmark_slake_inference.py --variant A7 --seed 2048
+
+# Aggregate and verify comparable fields across A0/A6/A7 (no GPU required)
+PYTHONPATH=. python other/benchmark_slake_inference.py --summary
+```
+
+Results are saved under `logs/efficiency_slake/` (`A0.json`, `A6.json`, `A7.json`, and `efficiency_comparison.csv`).
 
 ## Key Default Hyperparameters
 
